@@ -284,7 +284,8 @@ class BotInteractivo:
         self.add_process[uid] = {
             "step": 0, 
             "data": {"MATRICULA": callsign, "ICAO24": icao},
-            "prefilled": ["MATRICULA", "ICAO24"]
+            "prefilled": ["MATRICULA", "ICAO24"],
+            "is_reclutar": True
         }
         
         # Avanzar al primer paso no prellenado
@@ -313,14 +314,22 @@ class BotInteractivo:
 
                 prov = d["PROV"]
                 org = d["ORG"].lower()
-                # Auto-detección: Si el organismo contiene palabras de fuerzas de seguridad, categorizar como Militar
-                palabras_militares = ["fuerza aerea", "policia", "prefectura", "gendarmeria", "ejercito", "armada", "militar", "seguridad"]
-                if any(p in org for p in palabras_militares):
-                    prov = "Militar"
-                # Si no pone 'nacion' o 'presidencia' en Org y no es militar, entonces es provincial
-                elif not any(p in org for p in ["nacion", "presidencia", "nacional"]):
-                    if prov.lower() in ["nacional", "nacion", "", "none"]:
-                        prov = "Provincial"
+                
+                # Inteligencia de categoría auto-detectada únicamente si se inició el proceso via /reclutar
+                if state.get("is_reclutar"):
+                    # 1. Auto-detección Militar / Fuerzas de seguridad
+                    palabras_militares = ["fuerza aerea", "policia", "prefectura", "gendarmeria", "ejercito", "armada", "militar", "seguridad"]
+                    # 2. Auto-detección Privados (si contiene privado, empresa, persona)
+                    palabras_privadas = ["privado", "empresa", "persona"]
+                    
+                    if any(p in org for p in palabras_militares):
+                        prov = "Militar"
+                    elif any(p in org for p in palabras_privadas):
+                        prov = "Privado"
+                    # 3. Si no pone 'nacion' o 'presidencia' en Org y no es militar ni privado, entonces es provincial
+                    elif not any(p in org for p in ["nacion", "presidencia", "nacional"]):
+                        if prov.lower() in ["nacional", "nacion", "", "none"]:
+                            prov = "Provincial"
 
                 data = {
                     "matricula": d["MATRICULA"].upper(),
