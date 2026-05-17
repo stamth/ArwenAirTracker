@@ -265,9 +265,63 @@ class BotInteractivo:
         if not self._check_auth(update)[0]: return
         uid = update.effective_user.id
         if not context.args:
-            await update.message.reply_text("Uso: /reclutar <matricula_o_callsign>")
+            await update.message.reply_text("Uso:\n/reclutar <callsign> — Reclutar candidata nueva\n/reclutar <existente> + <candidata> — Unificar hex de candidata en avión existente")
             return
+        
+        # Detectar modo MERGE: /reclutar TC-69 + HERCULES
+        args_text = " ".join(context.args).upper()
+        if "+" in args_text:
+            parts = [p.strip() for p in args_text.split("+", 1)]
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                await update.message.reply_text("❌ Formato incorrecto. Uso: /reclutar <existente> + <candidata>")
+                return
             
+            mat_existente = parts[0]
+            mat_candidata = parts[1]
+            
+            from db import db as db_instance
+            with db_instance.connection_scope() as conn:
+                cursor = db_instance.get_cursor(conn)
+                ph = "%s" if db_instance.is_postgres else "?"
+                
+                # Verificar que el avión existente está en la base de datos
+                avion = cursor.execute(f"SELECT matricula, nombre, icao24 FROM aeronaves WHERE matricula = {ph}", (mat_existente,)).fetchone()
+                if not avion:
+                    await update.message.reply_text(f"❌ No se encontró el avión '{mat_existente}' en la base de datos.")
+                    return
+                
+                # Buscar la candidata y su hex
+                candidata = cursor.execute(f"SELECT callsign, icao24 FROM aeronaves_candidatas WHERE callsign = {ph}", (mat_candidata,)).fetchone()
+                if not candidata:
+                    await update.message.reply_text(f"❌ No se encontró la candidata '{mat_candidata}'. Usá /candidatas para ver la lista.")
+                    return
+                
+                nuevo_hex = candidata['icao24'] or ""
+                if not nuevo_hex:
+                    await update.message.reply_text(f"❌ La candidata '{mat_candidata}' no tiene código ICAO24 hex registrado.")
+                    return
+                
+                viejo_hex = avion['icao24'] or "(vacío)"
+                
+                # Actualizar el hex del avión existente
+                cursor.execute(f"UPDATE aeronaves SET icao24 = {ph} WHERE matricula = {ph}", (nuevo_hex, mat_existente))
+                
+                # Eliminar la candidata ya unificada
+                cursor.execute(f"DELETE FROM aeronaves_candidatas WHERE callsign = {ph}", (mat_candidata,))
+                
+                conn.commit()
+            
+            await update.message.reply_html(
+                f"✅ <b>MERGE COMPLETADO</b>\n\n"
+                f"✈️ Avión: <b>{avion['nombre']}</b> ({mat_existente})\n"
+                f"🔄 Hex anterior: <code>{viejo_hex}</code>\n"
+                f"🆕 Hex nuevo: <code>{nuevo_hex}</code> (de candidata '{mat_candidata}')\n"
+                f"🗑️ Candidata '{mat_candidata}' eliminada de la lista."
+            )
+            logger.info(f"[BOT] MERGE: {mat_existente} actualizado con hex {nuevo_hex} desde candidata {mat_candidata}")
+            return
+        
+        # --- Modo normal: reclutar candidata nueva ---
         callsign = context.args[0].upper()
         # Buscar en candidatas
         from db import db as db_instance
