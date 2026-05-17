@@ -262,12 +262,12 @@ class Database:
             count = cursor.rowcount
             return count
 
-    def purge_old_candidatas(self, hours=24):
-        """Elimina aeronaves candidatas que no han sido vistas en más de X horas."""
+    def purge_old_candidatas(self, hours=72):
+        """Elimina aeronaves candidatas cuyo primer avistamiento fue hace más de X horas."""
         with self.connection_scope() as conn:
             cursor = self.get_cursor(conn)
             cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat()
-            cursor.execute("DELETE FROM aeronaves_candidatas WHERE ultimo_avistamiento < %s" if self.is_postgres else "DELETE FROM aeronaves_candidatas WHERE ultimo_avistamiento < ?", (cutoff,))
+            cursor.execute("DELETE FROM aeronaves_candidatas WHERE primer_avistamiento < %s" if self.is_postgres else "DELETE FROM aeronaves_candidatas WHERE primer_avistamiento < ?", (cutoff,))
             return cursor.rowcount
 
     def add_usuario_autorizado(self, user_id, username):

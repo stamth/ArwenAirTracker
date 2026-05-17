@@ -150,7 +150,7 @@ async def tracker_staggered_task(tracker):
             # Mantenimiento profundo diario (aprox cada 1000 ciclos)
             if iteration % 1000 == 0:
                 pos_borradas = db.purge_old_positions(days=15)
-                cand_borradas = db.purge_old_candidatas(hours=24)
+                cand_borradas = db.purge_old_candidatas(hours=72)
                 logger.info(f"[DB-MANTENIMIENTO] Borradas {pos_borradas} posiciones antiguas del disco y {cand_borradas} candidatas expiradas.")
 
             # Heartbeat cada 10 minutos
