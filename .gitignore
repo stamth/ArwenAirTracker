@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+build/
+dist/
+
+# Configuration
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+debug.log
+startup_test.log
+nohup.out
+
+# Database
+*.db
+*.sqlite3
+aerobot.db
+bot_database.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
