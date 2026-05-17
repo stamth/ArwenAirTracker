@@ -103,6 +103,11 @@ class Database:
                     primer_avistamiento TEXT, ultimo_avistamiento TEXT, veces_visto INTEGER DEFAULT 1
                 )
             ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS callsigns_ignorados (
+                    callsign TEXT PRIMARY KEY, fecha TEXT
+                )
+            ''')
 
     def seed_db(self, aeronaves_data, matricula_to_icao):
         """Siembra y actualiza datos de aeronaves en cada inicio para reflejar cambios en matriculas.py."""
@@ -225,15 +230,42 @@ class Database:
     def save_aeronave_candidata(self, callsign, icao, pais, ts):
         with self.connection_scope() as conn:
             cursor = self.get_cursor(conn)
-            cursor.execute("SELECT callsign, veces_visto FROM aeronaves_candidatas WHERE callsign = %s" if self.is_postgres else "SELECT callsign, veces_visto FROM aeronaves_candidatas WHERE callsign = ?", (callsign,))
+            ph = "%s" if self.is_postgres else "?"
+            # Chequear si el callsign está en la lista de ignorados
+            cursor.execute(f"SELECT callsign FROM callsigns_ignorados WHERE callsign = {ph}", (callsign,))
+            if cursor.fetchone():
+                return False  # Ignorado permanentemente, no guardar
+            cursor.execute(f"SELECT callsign, veces_visto FROM aeronaves_candidatas WHERE callsign = {ph}", (callsign,))
             row = cursor.fetchone()
             if row:
                 v = (row['veces_visto'] or 1) + 1
-                cursor.execute("UPDATE aeronaves_candidatas SET ultimo_avistamiento=%s, veces_visto=%s WHERE callsign=%s" if self.is_postgres else "UPDATE aeronaves_candidatas SET ultimo_avistamiento=?, veces_visto=? WHERE callsign=?", (ts, v, callsign))
+                cursor.execute(f"UPDATE aeronaves_candidatas SET ultimo_avistamiento={ph}, veces_visto={ph} WHERE callsign={ph}", (ts, v, callsign))
                 return False
             else:
-                cursor.execute("INSERT INTO aeronaves_candidatas (callsign, icao24, pais, primer_avistamiento, ultimo_avistamiento, veces_visto) VALUES (%s,%s,%s,%s,%s,1)" if self.is_postgres else "INSERT INTO aeronaves_candidatas (callsign, icao24, pais, primer_avistamiento, ultimo_avistamiento, veces_visto) VALUES (?,?,?,?,?,1)", (callsign, icao, pais, ts, ts))
+                cursor.execute(f"INSERT INTO aeronaves_candidatas (callsign, icao24, pais, primer_avistamiento, ultimo_avistamiento, veces_visto) VALUES ({ph},{ph},{ph},{ph},{ph},1)", (callsign, icao, pais, ts, ts))
                 return True
+
+    def add_callsign_ignorado(self, callsign):
+        """Agrega un callsign a la lista negra permanente y lo borra de candidatas."""
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            ph = "%s" if self.is_postgres else "?"
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            cursor.execute(f"INSERT OR IGNORE INTO callsigns_ignorados (callsign, fecha) VALUES ({ph}, {ph})" if not self.is_postgres else f"INSERT INTO callsigns_ignorados (callsign, fecha) VALUES ({ph}, {ph}) ON CONFLICT DO NOTHING", (callsign, ts))
+            cursor.execute(f"DELETE FROM aeronaves_candidatas WHERE callsign = {ph}", (callsign,))
+
+    def remove_callsign_ignorado(self, callsign):
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            ph = "%s" if self.is_postgres else "?"
+            cursor.execute(f"DELETE FROM callsigns_ignorados WHERE callsign = {ph}", (callsign,))
+            return cursor.rowcount
+
+    def get_callsigns_ignorados(self):
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            cursor.execute("SELECT callsign, fecha FROM callsigns_ignorados ORDER BY fecha DESC")
+            return [dict(r) for r in cursor.fetchall()]
 
     def get_ultimas_posiciones(self, limite=15):
         with self.connection_scope() as conn:

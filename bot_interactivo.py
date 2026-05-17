@@ -463,6 +463,38 @@ class BotInteractivo:
             msg += f"• <code>{c['callsign']}</code> ({c['icao24']}) - Visto {c['veces_visto']} veces\n"
         await update.message.reply_html(msg)
 
+    async def ignorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update)[0]: return
+        if not context.args:
+            await update.message.reply_text("Uso: /ignorar <callsign>\nEjemplo: /ignorar FAU595")
+            return
+        callsign = context.args[0].upper()
+        db.add_callsign_ignorado(callsign)
+        await update.message.reply_html(f"🚫 <code>{callsign}</code> agregado a la lista negra.\nYa no aparecerá en /candidatas nunca más.")
+
+    async def designorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update)[0]: return
+        if not context.args:
+            await update.message.reply_text("Uso: /designorar <callsign>")
+            return
+        callsign = context.args[0].upper()
+        removed = db.remove_callsign_ignorado(callsign)
+        if removed:
+            await update.message.reply_html(f"✅ <code>{callsign}</code> removido de la lista negra.\nVolverá a aparecer en /candidatas si el cazador lo detecta.")
+        else:
+            await update.message.reply_text(f"'{callsign}' no estaba en la lista negra.")
+
+    async def ignorados(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._check_auth(update)[0]: return
+        lista = db.get_callsigns_ignorados()
+        if not lista:
+            await update.message.reply_text("No hay callsigns ignorados.")
+            return
+        msg = "🚫 <b>CALLSIGNS IGNORADOS:</b>\n\n"
+        for item in lista:
+            msg += f"• <code>{item['callsign']}</code> (desde {item['fecha'][:10]})\n"
+        await update.message.reply_html(msg)
+
     async def tweetstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not self._check_auth(update)[0]: return
         enabled = os.environ.get("TWITTER_ENABLED") == "1"
@@ -670,6 +702,9 @@ class BotInteractivo:
         self.app.add_handler(CommandHandler("cancelar", self.cancelar))
         self.app.add_handler(CommandHandler("quitar", self.quitar))
         self.app.add_handler(CommandHandler("candidatas", self.candidatas))
+        self.app.add_handler(CommandHandler("ignorar", self.ignorar))
+        self.app.add_handler(CommandHandler("designorar", self.designorar))
+        self.app.add_handler(CommandHandler("ignorados", self.ignorados))
         self.app.add_handler(CommandHandler("tweetstatus", self.tweetstatus))
         self.app.add_handler(CommandHandler("agregar_tweet", self.agregar_tweet))
         self.app.add_handler(CommandHandler("quitar_tweet", self.quitar_tweet))
