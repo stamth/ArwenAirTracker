@@ -3,6 +3,7 @@ import logging
 import time
 import datetime
 import tempfile
+import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from db import db
@@ -15,6 +16,7 @@ class BotInteractivo:
         self.token = os.environ.get("TELEGRAM_BOT_TOKEN")
         self.owner_id = int(os.environ.get("AUTHORIZED_USER_ID", 0))
         self.last_command_ts = {}
+        self.unauth_attempts = {}
         self.app = None
         self.add_process = {} # Diccionario para rastrear el estado del usuario en /agregar
         
@@ -28,38 +30,58 @@ class BotInteractivo:
         auth_users = [u['user_id'] for u in db.get_usuarios_autorizados()]
         return user_id in auth_users
 
-    def _check_auth(self, update: Update):
+    async def _handle_unauth(self, update: Update, is_admin_check=False):
+        uid = update.effective_user.id
+        attempts = self.unauth_attempts.get(uid, 0) + 1
+        self.unauth_attempts[uid] = attempts
+        if attempts == 1:
+            logger.warning(f"[BOT] Intento no autorizado: {uid} (Aviso enviado)")
+            msg = "⛔ Comando rechazado. No tienes nivel de administrador." if is_admin_check else "⛔ Acceso denegado. Contactá a @AarwenAirTracker"
+            try:
+                await update.message.reply_text(msg)
+            except: pass
+        elif attempts == 2:
+            logger.warning(f"[BOT] Intento no autorizado: {uid} (Baneo silencioso activado)")
+
+    def _sanitize_args(self, args, max_len=15):
+        if not args: return True
+        for arg in args:
+            if len(arg) > max_len: return False
+            if not re.match(r'^[A-Z0-9\-\+]+$', arg.upper()): return False
+        return True
+
+    async def _check_auth(self, update: Update):
         uid = update.effective_user.id
         if not self._is_admin(uid):
-            logger.warning(f"[BOT] Intento de acceso no autorizado: {uid}")
-            return False, True  # Not auth, IS unauthorized attempt
+            await self._handle_unauth(update, False)
+            return False
         
         now = time.time()
         last = self.last_command_ts.get(uid, 0)
         if now - last < 2:
-            return False, False
+            return False
         self.last_command_ts[uid] = now
-        return True, False  # Auth OK, not unauthorized
+        return True
 
-    def _check_owner(self, update: Update):
+    async def _check_owner(self, update: Update, silent=False):
         uid = update.effective_user.id
-        return uid == self.owner_id
+        if uid != self.owner_id:
+            if not silent:
+                await self._handle_unauth(update, True)
+            return False
+        return True
 
     # --- COMANDOS BÁSICOS ---
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        auth, unauth = self._check_auth(update)
-        if unauth:
-            await update.message.reply_text("⛔ No tienes acceso. Contactá al administrador via Twitter/X: @AarwenAirTracker")
-            return
-        if not auth: return
+        if not await self._check_auth(update): return
         msg = "👋 <b>Hola! Soy Aerobot.</b>\n\n"
         msg += "El sistema de monitoreo híbrido está activo.\n"
         msg += "Usa /comandos para ver todo lo que puedo hacer."
         await update.message.reply_html(msg)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE, skip_auth=False):
-        if not skip_auth and not self._check_auth(update)[0]: return
+        if not skip_auth and not await self._check_auth(update): return
         msg = "📊 <b>Comandos Disponibles:</b>\n\n"
         msg += "/aviones o /flota - Ver la flota monitoreada\n"
         msg += "/rastreando - Ver aviones en vuelo ahora\n"
@@ -72,7 +94,7 @@ class BotInteractivo:
         msg += "/estado - Verifica el estado del bot\n"
         msg += "/comandos - Muestra esta lista\n\n"
         
-        if self._check_owner(update):
+        if await self._check_owner(update, silent=True):
             msg += "👑 <b>Comandos de Administrador:</b>\n"
             msg += "/autorizar &lt;id&gt; &lt;nombre&gt; - Dar acceso\n"
             msg += "/desautorizar &lt;id&gt; - Quitar acceso\n"
@@ -98,7 +120,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_flota(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         aeronaves = db.get_all_aeronaves(solo_activas=True)
         msg = "📋 <b>FLOTA MONITOREADA:</b>\n\n"
         for a in aeronaves:
@@ -106,7 +128,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_posiciones(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         posiciones = db.get_ultimas_posiciones(limite=20)
         if not posiciones:
             await update.message.reply_text("No hay posiciones recientes registradas.")
@@ -117,7 +139,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_ranking(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         ranking = stats.get_ranking_gasto()
         if not ranking:
             await update.message.reply_text("No hay datos de gastos suficientes.")
@@ -128,9 +150,12 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         if not context.args:
             await update.message.reply_text("Uso: /stats <matricula>")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         mat = context.args[0].upper()
         s = stats.get_stats_aeronave(mat)
@@ -146,7 +171,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_weekly(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         res = stats.get_resumen_semanal()
         if not res or not res['totales']:
             await update.message.reply_text("No hay datos de esta semana.")
@@ -162,7 +187,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         v_activos = db.get_conteo_detectados()
         msg = "🌐 <b>ESTADO DEL SISTEMA</b>\n\n"
         msg += f"Vuelos en radar vivo: <b>{v_activos}</b>\n"
@@ -170,7 +195,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def get_rastreando(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         vuelos = db.get_vuelos_activos()
         if not vuelos:
             await update.message.reply_text("🔇 No hay aviones rastreados en este momento.")
@@ -226,7 +251,7 @@ class BotInteractivo:
             await update.message.reply_text("El ID debe ser numérico.")
 
     async def desautorizar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /desautorizar <id>")
             return
@@ -238,7 +263,7 @@ class BotInteractivo:
             pass
 
     async def usuarios(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         users = db.get_usuarios_autorizados()
         if not users:
             await update.message.reply_text("No hay usuarios adicionales autorizados.")
@@ -249,22 +274,25 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def deletestats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /deletestats <matricula>")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         mat = context.args[0].upper()
         db.delete_stats_aeronave(mat)
         await update.message.reply_text(f"Historial de {mat} borrado.")
 
     async def agregar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         uid = update.effective_user.id
         self.add_process[uid] = {"step": 0, "data": {}}
         await update.message.reply_text(f"📝 Nueva Aeronave\n1. {self.add_steps[0]}:")
 
     async def cancelar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         uid = update.effective_user.id
         if uid in self.add_process:
             del self.add_process[uid]
@@ -273,10 +301,13 @@ class BotInteractivo:
             await update.message.reply_text("No hay ningún proceso activo para cancelar.")
 
     async def reclutar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         uid = update.effective_user.id
         if not context.args:
             await update.message.reply_text("Uso:\n/reclutar <callsign> — Reclutar candidata nueva\n/reclutar <existente> + <candidata> — Unificar hex de candidata en avión existente")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         
         # Detectar modo MERGE: /reclutar TC-69 + HERCULES
@@ -427,7 +458,7 @@ class BotInteractivo:
                 del self.add_process[uid]
 
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         uid = update.effective_user.id
         
         if not update.message.text: return
@@ -455,16 +486,19 @@ class BotInteractivo:
 
 
     async def quitar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /quitar <matricula>")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         mat = context.args[0].upper()
         db.update_aeronave_status(mat, 0)
         await update.message.reply_text(f"Aeronave {mat} desactivada del rastreo.")
 
     async def candidatas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         cand = db.get_aeronaves_candidatas()
         if not cand:
             await update.message.reply_text("No hay candidatas detectadas por el cazador.")
@@ -475,18 +509,24 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def ignorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /ignorar <callsign>\nEjemplo: /ignorar FAU595")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         callsign = context.args[0].upper()
         db.add_callsign_ignorado(callsign)
         await update.message.reply_html(f"🚫 <code>{callsign}</code> agregado a la lista negra.\nYa no aparecerá en /candidatas nunca más.")
 
     async def designorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /designorar <callsign>")
+            return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
             return
         callsign = context.args[0].upper()
         removed = db.remove_callsign_ignorado(callsign)
@@ -496,7 +536,7 @@ class BotInteractivo:
             await update.message.reply_text(f"'{callsign}' no estaba en la lista negra.")
 
     async def ignorados(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         lista = db.get_callsigns_ignorados()
         if not lista:
             await update.message.reply_text("No hay callsigns ignorados.")
@@ -507,7 +547,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def tweetstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         enabled = os.environ.get("TWITTER_ENABLED") == "1"
         wl = db.get_setting("twitter_whitelist", "")
         msg = f"🐦 Twitter Enabled: <b>{'SI' if enabled else 'NO'}</b>\n"
@@ -515,8 +555,11 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def agregar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args: return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
+            return
         mat = context.args[0].upper()
         wl = db.get_setting("twitter_whitelist", "")
         mats = [m.strip() for m in wl.split(",")] if wl else []
@@ -526,8 +569,11 @@ class BotInteractivo:
         await update.message.reply_text(f"{mat} agregada a la whitelist de Twitter.")
 
     async def quitar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         if not context.args: return
+        if not self._sanitize_args(context.args):
+            await update.message.reply_text("⛔ Formato inválido.")
+            return
         mat = context.args[0].upper()
         wl = db.get_setting("twitter_whitelist", "")
         mats = [m.strip() for m in wl.split(",")] if wl else []
@@ -537,12 +583,12 @@ class BotInteractivo:
         await update.message.reply_text(f"{mat} removida de la whitelist de Twitter.")
 
     async def listar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): return
+        if not await self._check_owner(update): return
         wl = db.get_setting("twitter_whitelist", "")
         await update.message.reply_text(f"Whitelist Twitter: {wl if wl else 'Vacia (Aplica a todas)'}")
 
     async def generar_informe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not await self._check_auth(update): return
         
         await update.message.reply_text("⏳ Generando informe Excel, espere...")
         
@@ -551,6 +597,10 @@ class BotInteractivo:
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             
             # Determinar si es informe general o por matrícula
+            if context.args:
+                if not self._sanitize_args(context.args):
+                    await update.message.reply_text("⛔ Formato inválido.")
+                    return
             mat_filter = context.args[0].upper() if context.args else None
             
             if mat_filter:
