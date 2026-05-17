@@ -71,26 +71,29 @@ class BotInteractivo:
         msg += "/informe &lt;mat&gt; - Excel de un avión\n"
         msg += "/estado - Verifica el estado del bot\n"
         msg += "/comandos - Muestra esta lista\n\n"
-        msg += "👑 <b>Comandos de Administrador:</b>\n"
-        msg += "/autorizar &lt;id&gt; &lt;nombre&gt; - Dar acceso\n"
-        msg += "/desautorizar &lt;id&gt; - Quitar acceso\n"
-        msg += "/usuarios - Ver autorizados\n"
-        msg += "/deletestats &lt;matricula&gt; - Borrar historial\n"
-        msg += "/agregar - Agregar aeronave manualmente\n"
-        msg += "/quitar &lt;matricula&gt; - Dejar de seguir\n\n"
-        msg += "🕵️ <b>Cazador Inteligente:</b>\n"
-        msg += "/candidatas - Ver hallazgos del cazador\n"
-        msg += "/reclutar &lt;callsign&gt; - Reclutar candidata\n"
-        msg += "/reclutar &lt;existente&gt; + &lt;candidata&gt; - Merge hex\n"
-        msg += "/cancelar - Cancelar proceso de carga\n"
-        msg += "/ignorar &lt;callsign&gt; - Lista negra permanente\n"
-        msg += "/designorar &lt;callsign&gt; - Sacar de lista negra\n"
-        msg += "/ignorados - Ver lista negra\n\n"
-        msg += "🐦 <b>Twitter:</b>\n"
-        msg += "/tweetstatus - Estado de Twitter\n"
-        msg += "/agregar_tweet &lt;mat&gt; - Autorizar Twitter\n"
-        msg += "/quitar_tweet &lt;mat&gt; - Revocar Twitter\n"
-        msg += "/listar_tweet - Matrículas autorizadas\n\n"
+        
+        if self._check_owner(update):
+            msg += "👑 <b>Comandos de Administrador:</b>\n"
+            msg += "/autorizar &lt;id&gt; &lt;nombre&gt; - Dar acceso\n"
+            msg += "/desautorizar &lt;id&gt; - Quitar acceso\n"
+            msg += "/usuarios - Ver autorizados\n"
+            msg += "/deletestats &lt;matricula&gt; - Borrar historial\n"
+            msg += "/agregar - Agregar aeronave manualmente\n"
+            msg += "/quitar &lt;matricula&gt; - Dejar de seguir\n\n"
+            msg += "🕵️ <b>Cazador Inteligente:</b>\n"
+            msg += "/candidatas - Ver hallazgos del cazador\n"
+            msg += "/reclutar &lt;callsign&gt; - Reclutar candidata\n"
+            msg += "/reclutar &lt;existente&gt; + &lt;candidata&gt; - Merge hex\n"
+            msg += "/cancelar - Cancelar proceso de carga\n"
+            msg += "/ignorar &lt;callsign&gt; - Lista negra permanente\n"
+            msg += "/designorar &lt;callsign&gt; - Sacar de lista negra\n"
+            msg += "/ignorados - Ver lista negra\n\n"
+            msg += "🐦 <b>Twitter:</b>\n"
+            msg += "/tweetstatus - Estado de Twitter\n"
+            msg += "/agregar_tweet &lt;mat&gt; - Autorizar Twitter\n"
+            msg += "/quitar_tweet &lt;mat&gt; - Revocar Twitter\n"
+            msg += "/listar_tweet - Matrículas autorizadas\n\n"
+            
         msg += "🆔 /miid - Ver tu ID de Telegram"
         await update.message.reply_html(msg)
 
@@ -246,7 +249,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def deletestats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /deletestats <matricula>")
             return
@@ -255,12 +258,13 @@ class BotInteractivo:
         await update.message.reply_text(f"Historial de {mat} borrado.")
 
     async def agregar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         uid = update.effective_user.id
         self.add_process[uid] = {"step": 0, "data": {}}
         await update.message.reply_text(f"📝 Nueva Aeronave\n1. {self.add_steps[0]}:")
 
     async def cancelar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not self._check_owner(update): return
         uid = update.effective_user.id
         if uid in self.add_process:
             del self.add_process[uid]
@@ -269,7 +273,7 @@ class BotInteractivo:
             await update.message.reply_text("No hay ningún proceso activo para cancelar.")
 
     async def reclutar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         uid = update.effective_user.id
         if not context.args:
             await update.message.reply_text("Uso:\n/reclutar <callsign> — Reclutar candidata nueva\n/reclutar <existente> + <candidata> — Unificar hex de candidata en avión existente")
@@ -451,7 +455,7 @@ class BotInteractivo:
 
 
     async def quitar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /quitar <matricula>")
             return
@@ -460,7 +464,7 @@ class BotInteractivo:
         await update.message.reply_text(f"Aeronave {mat} desactivada del rastreo.")
 
     async def candidatas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         cand = db.get_aeronaves_candidatas()
         if not cand:
             await update.message.reply_text("No hay candidatas detectadas por el cazador.")
@@ -471,7 +475,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def ignorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /ignorar <callsign>\nEjemplo: /ignorar FAU595")
             return
@@ -480,7 +484,7 @@ class BotInteractivo:
         await update.message.reply_html(f"🚫 <code>{callsign}</code> agregado a la lista negra.\nYa no aparecerá en /candidatas nunca más.")
 
     async def designorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args:
             await update.message.reply_text("Uso: /designorar <callsign>")
             return
@@ -492,7 +496,7 @@ class BotInteractivo:
             await update.message.reply_text(f"'{callsign}' no estaba en la lista negra.")
 
     async def ignorados(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         lista = db.get_callsigns_ignorados()
         if not lista:
             await update.message.reply_text("No hay callsigns ignorados.")
@@ -503,7 +507,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def tweetstatus(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         enabled = os.environ.get("TWITTER_ENABLED") == "1"
         wl = db.get_setting("twitter_whitelist", "")
         msg = f"🐦 Twitter Enabled: <b>{'SI' if enabled else 'NO'}</b>\n"
@@ -511,7 +515,7 @@ class BotInteractivo:
         await update.message.reply_html(msg)
 
     async def agregar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args: return
         mat = context.args[0].upper()
         wl = db.get_setting("twitter_whitelist", "")
@@ -522,7 +526,7 @@ class BotInteractivo:
         await update.message.reply_text(f"{mat} agregada a la whitelist de Twitter.")
 
     async def quitar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         if not context.args: return
         mat = context.args[0].upper()
         wl = db.get_setting("twitter_whitelist", "")
@@ -533,7 +537,7 @@ class BotInteractivo:
         await update.message.reply_text(f"{mat} removida de la whitelist de Twitter.")
 
     async def listar_tweet(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_auth(update)[0]: return
+        if not self._check_owner(update): return
         wl = db.get_setting("twitter_whitelist", "")
         await update.message.reply_text(f"Whitelist Twitter: {wl if wl else 'Vacia (Aplica a todas)'}")
 
