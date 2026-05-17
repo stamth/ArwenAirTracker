@@ -311,11 +311,18 @@ class BotInteractivo:
                     except ValueError:
                         return 0.0
 
+                prov = d["PROV"]
+                org = d["ORG"].lower()
+                # Auto-detección: Si el organismo contiene palabras de fuerzas de seguridad, categorizar como Militar
+                palabras_militares = ["fuerza aerea", "policia", "prefectura", "gendarmeria", "ejercito", "armada", "militar", "seguridad"]
+                if any(p in org for p in palabras_militares):
+                    prov = "Militar"
+
                 data = {
                     "matricula": d["MATRICULA"].upper(),
                     "nombre": d["NOMBRE"],
                     "organismo": d["ORG"],
-                    "provincia": d["PROV"],
+                    "provincia": prov,
                     "marca": d["MARCA"],
                     "modelo": d["MODELO"],
                     "precio_usd": parse_float(d["PRECIO"]),

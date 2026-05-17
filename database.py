@@ -105,27 +105,32 @@ class Database:
             ''')
 
     def seed_db(self, aeronaves_data, matricula_to_icao):
-        """Siembra datos iniciales usando nombres de columnas para evitar errores de indice."""
+        """Siembra y actualiza datos de aeronaves en cada inicio para reflejar cambios en matriculas.py."""
         with self.connection_scope() as conn:
             cursor = self.get_cursor(conn)
-            cursor.execute("SELECT COUNT(*) as c FROM aeronaves")
-            if cursor.fetchone()['c'] == 0:
-                logger.info("[DB] Sembrando datos iniciales...")
-                # Definimos el orden de los campos en AERONAVES_DATA de matriculas.py
-                fields = [
-                    "matricula", "nombre", "organismo", "provincia", 
-                    "marca", "modelo", "precio_usd", "costo_hora_usd", 
-                    "litros_hora_estimado", "co2_kg_hora_estimado"
-                ]
-                for item in aeronaves_data:
-                    # Mapear los datos de la lista al diccionario de columnas
-                    data = dict(zip(fields, item))
-                    data["icao24"] = matricula_to_icao.get(data["matricula"], "").lower()
-                    data["activa"] = 1
-                    
-                    cols = ", ".join(data.keys())
-                    vals = ", ".join(["%s" if self.is_postgres else ":" + k for k in data.keys()])
-                    cursor.execute(f"INSERT INTO aeronaves ({cols}) VALUES ({vals})", data)
+            logger.info("[DB] Sincronizando catálogo de aeronaves desde matriculas.py...")
+            # Definimos el orden de los campos en AERONAVES_DATA de matriculas.py
+            fields = [
+                "matricula", "nombre", "organismo", "provincia", 
+                "marca", "modelo", "precio_usd", "costo_hora_usd", 
+                "litros_hora_estimado", "co2_kg_hora_estimado"
+            ]
+            for item in aeronaves_data:
+                # Mapear los datos de la lista al diccionario de columnas
+                data = dict(zip(fields, item))
+                data["icao24"] = matricula_to_icao.get(data["matricula"], "").lower()
+                data["activa"] = 1
+                
+                cols = ", ".join(data.keys())
+                if self.is_postgres:
+                    vals = ", ".join(["%s" for _ in data])
+                    set_clause = ", ".join([f"{k} = EXCLUDED.{k}" for k in data.keys() if k != "matricula"])
+                    sql = f"INSERT INTO aeronaves ({cols}) VALUES ({vals}) ON CONFLICT (matricula) DO UPDATE SET {set_clause}"
+                else:
+                    vals = ", ".join([f":{k}" for k in data.keys()])
+                    sql = f"INSERT OR REPLACE INTO aeronaves ({cols}) VALUES ({vals})"
+                
+                cursor.execute(sql, data)
 
     # --- METODOS DE VUELOS ---
     def purge_ghost_vuelos(self, horas=12):
