@@ -54,13 +54,6 @@ AERONAVES_DATA = [
     ("LQ-ZLS", "LQ-ZLS (Tucuman)", "Gobierno de Tucuman", "Tucuman", "Eurocopter", "AS-350", 2500000, 1800, 220, 550),
     ("LQ-ZPX", "LQ-ZPX (Tucuman)", "Gobierno de Tucuman", "Tucuman", "Beechcraft", "B-200", 2500000, 1900, 400, 1000),
     ("LQ-ZTH", "LQ-ZTH (San Luis)", "Gobierno de San Luis", "San Luis", "Cessna", "Citation V", 2500000, 4800, 750, 1880),
-    
-    # CONTRATADAS
-    ("LV-CCO", "LV-CCO", "Baires Fly", "Contratada", "Bombardier", "Learjet 60", 3500000, 5200, 800, 2000),
-    ("LV-CPL", "LV-CPL", "Baires Fly", "Contratada", "Bombardier", "Learjet 60", 2500000, 5200, 800, 2000),
-    ("LV-FUF", "LV-FUF", "Baires Fly", "Contratada", "Bombardier", "Learjet 60", 2500000, 5200, 800, 2000),
-    ("LV-FVZ", "LV-FVZ", "Baires Fly", "Contratada", "Bombardier", "Learjet 60", 2500000, 5200, 800, 2000),
-    ("LV-IYQ", "LV-IYQ", "Baires Fly", "Contratada", "Bombardier", "Learjet 35", 700000, 3800, 650, 1650),
     ("LV-KJY", "LV-KJY (Sanitario SC)", "Gobierno de Santa Cruz", "Santa Cruz", "Pilatus", "PC-24", 14000000, 5000, 600, 1700),
     
     # MILITARES
@@ -72,14 +65,12 @@ MATRICULA_TO_ICAO24 = {
     "ARG-01": "e00000", "ARG-02": "e00001", "ARG-03": "e14d34", 
     "ARG-10": "e00002", "ARG-11": "e00003", "ARG-12": "e00004", 
     "LQ-BFS": "e02193", "LQ-CPS": "e03413", "LQ-WOT": "e00015",
-    "LV-CCO": "e030cf", "LV-CLK": "e0330b", "LV-CPL": "e0340c", 
-    "LV-CTX": "e03518", "LV-FUF": "e06546", "LV-FUK": "e0654b", 
-    "LV-FVZ": "e0659a", "LV-GQK": "e0744b", "LV-IYQ": "e09651", 
-    "LV-JQF": "e0a446", "LV-JQV": "e0a456", "LV-KFB": "e0b182", 
-    "LV-KFL": "e0b18c", "LV-WTV": "e17516", "T-10": "e14c70", 
-    "T-33": "e20011", "T-99": "e200ae", "TC-52": "e20004", 
-    "TC-61": "e20007", "TC-64": "e20008", "TC-66": "e20094", 
-    "TC-70": "e20049",
+    "LV-CLK": "e0330b", "LV-CTX": "e03518", "LV-FUK": "e0654b", 
+    "LV-GQK": "e0744b", "LV-JQF": "e0a446", "LV-JQV": "e0a456", 
+    "LV-KFB": "e0b182", "LV-KFL": "e0b18c", "LV-WTV": "e17516", 
+    "T-10": "e14c70", "T-33": "e20011", "T-99": "e200ae", 
+    "TC-52": "e20004", "TC-61": "e20007", "TC-64": "e20008", 
+    "TC-66": "e20094", "TC-70": "e20049",
 }
 
 # FIX: No filtramos por e000 ya que son validos para la flota presidencial.

@@ -317,6 +317,10 @@ class BotInteractivo:
                 palabras_militares = ["fuerza aerea", "policia", "prefectura", "gendarmeria", "ejercito", "armada", "militar", "seguridad"]
                 if any(p in org for p in palabras_militares):
                     prov = "Militar"
+                # Si no pone 'nacion' o 'presidencia' en Org y no es militar, entonces es provincial
+                elif not any(p in org for p in ["nacion", "presidencia", "nacional"]):
+                    if prov.lower() in ["nacional", "nacion", "", "none"]:
+                        prov = "Provincial"
 
                 data = {
                     "matricula": d["MATRICULA"].upper(),
