@@ -7,6 +7,15 @@ import datetime
 import time
 from dotenv import load_dotenv
 
+# Forzar IPv4 para evitar timeouts de IPv6 en servidores con IPv6 roto o sin ruteo externo
+import socket
+orig_getaddrinfo = socket.getaddrinfo
+def forced_ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == socket.AF_UNSPEC:
+        family = socket.AF_INET
+    return orig_getaddrinfo(host, port, family, type, proto, flags)
+socket.getaddrinfo = forced_ipv4_getaddrinfo
+
 load_dotenv()
 
 import logging.handlers
