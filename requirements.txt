@@ -1,7 +1,7 @@
-httpx>=0.24.0
-python-telegram-bot>=20.0
-tweepy>=4.14.0
-psycopg2-binary>=2.9.0
-geopy>=2.3.0
-python-dotenv>=1.0.0
-openpyxl>=3.1.0
+httpx==0.28.1
+python-telegram-bot==22.8
+tweepy==4.17.0
+psycopg2-binary==2.9.12
+geopy==2.5.0
+python-dotenv==1.2.2
+openpyxl==3.1.5

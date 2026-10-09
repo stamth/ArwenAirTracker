@@ -142,13 +142,6 @@ async def tracker_staggered_task(tracker):
                 sleep_time = max(0, STEP_SECONDS - elapsed_step)
                 await asyncio.sleep(sleep_time)
             
-            # Cálculo de espera final para sincronizar el ciclo
-            elapsed = time.time() - start_time
-            wait_time = max(0, 90 - elapsed)
-            if wait_time > 0:
-                logger.info(f"[RADAR] Ciclo completado en {elapsed:.1f}s. Esperando {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-            
             # Purga cada 10 ciclos
             if iteration % 10 == 0:
                 purged_smart = await tracker.check_ghost_landings()
@@ -162,7 +155,7 @@ async def tracker_staggered_task(tracker):
                 cand_borradas = db.purge_old_candidatas(hours=72)
                 logger.info(f"[DB-MANTENIMIENTO] Borradas {pos_borradas} posiciones antiguas del disco y {cand_borradas} candidatas expiradas.")
 
-            # Heartbeat cada 10 minutos
+            # Heartbeat cada 10 ciclos (~15 minutos)
             if iteration % 10 == 0:
                 mem_n = len(tracker.hourly_stats["Norte"]["total"])
                 mem_s = len(tracker.hourly_stats["Sur"]["total"])
@@ -238,14 +231,24 @@ async def hourly_status_task(tracker, notificador):
             msg += f"📡 {len(vuelos_activos)} aeronave{'s' if len(vuelos_activos) > 1 else ''} en radar"
             
             await notificador.alertar_especial(msg, throttle_key="hourly_report")
-            
-            # Sincronización de DB a disco cada hora (Si estamos en modo RAM)
-            if USE_RAM_DB:
-                logger.info("[CLOCK] Sincronizando Base de Datos de RAM a Disco...")
-                db.backup_to_disk(DB_ORIGINAL)
                 
         except Exception as e:
             logger.error(f"[MAIN] Error reporte: {e}")
+            await asyncio.sleep(60)
+
+async def db_sync_task():
+    """Sincroniza la DB de RAM a disco cada 15 minutos como red de seguridad."""
+    logger.info("[DB-SYNC] Tarea de sincronización periódica iniciada (cada 15 min).")
+    while True:
+        try:
+            await asyncio.sleep(900)  # 15 minutos
+            if USE_RAM_DB:
+                logger.info("[DB-SYNC] Sincronizando Base de Datos de RAM a Disco...")
+                db.backup_to_disk(DB_ORIGINAL)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[DB-SYNC] Error en sync periódico: {e}")
             await asyncio.sleep(60)
 
 async def run_bot_and_tracker():
@@ -260,14 +263,15 @@ async def run_bot_and_tracker():
     await notificador.alertar_especial("🚀 <b>ARWEN AIR TRACKER ONLINE</b>\n\nEl sistema híbrido de rastreo ha comenzado a operar.\nModo: Rotación Cruzada (N/S)\nFuentes: 4 APIs Activas")
     
     tasks = [
-        tracker_staggered_task(tracker), 
-        bot.run_async(), 
-        hourly_status_task(tracker, notificador)
+        asyncio.create_task(tracker_staggered_task(tracker)), 
+        asyncio.create_task(bot.run_async()), 
+        asyncio.create_task(hourly_status_task(tracker, notificador)),
+        asyncio.create_task(db_sync_task())
     ]
     
     logger.info("[SISTEMA] Verificando credenciales de APIs...")
     opensky_status = await tracker.verify_auth()
-    twitter_ok = notificador.verify_auth()
+    twitter_ok = await asyncio.to_thread(notificador.verify_auth)
     
     if opensky_status == "OK" and twitter_ok:
         logger.info("[SISTEMA] ✅ Credenciales cargadas correctamente de OpenSky y Twitter.")
@@ -282,21 +286,61 @@ async def run_bot_and_tracker():
         else: logger.error("[SISTEMA] ❌ Twitter: Error de autenticación.")
         
     logger.info("[SISTEMA] Iniciando Tracker + Bot + Reportes...")
+    
+    loop = asyncio.get_running_loop()
+    def handle_sigterm():
+        logger.info("[SISTEMA] Señal de apagado (SIGTERM/SIGINT) recibida. Cancelando tareas para apagado seguro...")
+        for task in tasks:
+            task.cancel()
+            
+    if os.name != 'nt':
+        loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+        loop.add_signal_handler(signal.SIGINT, handle_sigterm)
+        
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("[SISTEMA] Parada solicitada. Apagando...")
     finally:
         if USE_RAM_DB:
-            logger.info("[SISTEMA] Sincronización FINAL de DB a Disco antes de salir...")
+            logger.info("[SISTEMA] Sincronización FINAL de DB a Disco antes de salir (incluye apagados por señal SIGTERM/SIGINT)...")
             db.backup_to_disk(DB_ORIGINAL)
 
 if __name__ == "__main__":
     if os.name != 'nt':
-        # Auto-limpieza agresiva de otras instancias antes de iniciar para evitar conflictos de Telegram o DB
+        # Auto-limpieza de otras instancias de este mismo bot en este directorio para evitar conflictos de Telegram o DB
         my_pid = os.getpid()
-        cleanup_cmd = f"pgrep -f 'main.py' | grep -v {my_pid} | xargs kill -9 2>/dev/null || true"
-        os.system(cleanup_cmd)
+        my_cwd = os.path.dirname(os.path.abspath(__file__))
+        viejos = []
+        for pid_str in os.listdir('/proc'):
+            if pid_str.isdigit():
+                pid = int(pid_str)
+                if pid == my_pid:
+                    continue
+                try:
+                    with open(f'/proc/{pid}/cmdline', 'r') as f:
+                        cmd = f.read()
+                    if 'main.py' in cmd:
+                        cwd = os.readlink(f'/proc/{pid}/cwd')
+                        if os.path.abspath(cwd) == os.path.abspath(my_cwd):
+                            viejos.append(pid)
+                except Exception:
+                    pass
+        # Primero SIGTERM (la instancia vieja guarda su DB a disco), y SIGKILL solo si no cierra
+        for pid in viejos:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for _ in range(20):
+            if not any(os.path.exists(f'/proc/{pid}') for pid in viejos):
+                break
+            time.sleep(0.5)
+        for pid in viejos:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         time.sleep(1.0) # Esperar a que se liberen sockets/puertos/recursos
 
     try:

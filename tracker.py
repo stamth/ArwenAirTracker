@@ -12,6 +12,10 @@ from aeropuertos import AEROPUERTOS
 
 logger = logging.getLogger(__name__)
 
+# Airplanes.live pausado: desde oct-2026 responde 403 a todo y pide contactarlos
+# (contact@airplanes.live). Volver a True cuando habiliten el acceso.
+AIRPLANES_LIVE_ENABLED = False
+
 TOURIST_DESTINATIONS = {"Bariloche", "Iguazú", "El Calafate", "Ushuaia", "Punta del Este"}
 OFFICIAL_PREFIXES = ("LQ", "ARG", "PG", "GN", "AE", "PA")
 COMMERCIAL_PREFIXES = ("LV", "LVL", "LVS", "AEA", "DSM", "IBE", "AAL", "UAL", "DAL", "AFR", "BAW", "DLH", "TAM", "GLO", "AZU", "CMP", "AVA", "BOV")
@@ -98,11 +102,20 @@ class Tracker:
 
     async def fetch_airplanes_live(self, lat=-35.0, lon=-64.0, dist=1500):
         """Usa Airplanes.live con punto y radio (más liviano)"""
+        if not AIRPLANES_LIVE_ENABLED:
+            return []
         url = f"https://api.airplanes.live/v2/point/{lat}/{lon}/{dist}"
         headers = {"User-Agent": "ArwenAirTracker/1.0"}
         try:
             async with httpx.AsyncClient(headers=headers) as client:
                 r = await client.get(url, timeout=15.0)
+                # Avisar solo cuando cambia el estado, para no llenar el log cada 12s
+                if r.status_code != getattr(self, "_airplanes_live_status", 200):
+                    if r.status_code == 200:
+                        logger.info("[AIRPLANES.LIVE] Volvió a responder (HTTP 200).")
+                    else:
+                        logger.warning(f"[AIRPLANES.LIVE] HTTP {r.status_code}: {r.text[:150]}")
+                self._airplanes_live_status = r.status_code
                 if r.status_code == 200:
                     data = r.json().get("ac") or []
                     return self._parse_adsb_exchange(data, bbox=None, source="Airplanes.live")
@@ -112,6 +125,8 @@ class Tracker:
 
     async def fetch_airplanes_live_hex(self, icao24_list):
         """Consulta Airplanes.live usando una sola petición con múltiples hex para evitar baneos."""
+        if not AIRPLANES_LIVE_ENABLED:
+            return []
         if not icao24_list: return []
         # Filtramos vacíos y unimos con comas
         hex_string = ",".join([h.lower() for h in icao24_list if h])
@@ -203,8 +218,8 @@ class Tracker:
         if not self.opensky_tokens.is_configured():
             return None
 
-        # Filtrar icao24s válidos
-        icao_validos = [i.lower() for i in icao24_list if i and len(i) == 6 and not i.lower().startswith("e0000")]
+        # Filtrar icao24s válidos (evitando placeholders e00000-e000ff y nulos)
+        icao_validos = [i.lower() for i in icao24_list if i and len(i) == 6 and not (i.lower() == "e00000" or i.lower() == "000000" or re.match(r'^e000[0-9a-f]{2}$', i.lower()))]
         if not icao_validos:
             return None
 
@@ -370,7 +385,15 @@ class Tracker:
         now_str = now_utc.isoformat()
         
         flota_db = db.get_all_aeronaves(solo_activas=True)
-        watchlist_hex = {a['icao24'].lower(): a for a in flota_db if a['icao24']}
+        watchlist_hex = {}
+        for a in flota_db:
+            icao = a.get('icao24')
+            if icao:
+                icao = icao.lower().strip()
+                # Filtrar placeholders y códigos inválidos
+                if icao == "e00000" or icao == "000000" or re.match(r'^e000[0-9a-f]{2}$', icao):
+                    continue
+                watchlist_hex[icao] = a
         watchlist_reg = {self._normalize_text(a['matricula']): a for a in flota_db}
         # Mapa adicional por nombre (para matchear callsigns como "Cruz Del Sur")
         watchlist_call = {self._normalize_text(a['nombre']): a for a in flota_db if a.get('nombre')}
@@ -403,14 +426,16 @@ class Tracker:
                 # AUTO-UPDATE: Si lo detectamos por registro/callsign pero su ICAO24 cambió o faltaba, actualizar
                 db_icao = (a_db.get('icao24') or '').lower()
                 if icao24 and icao24 != db_icao:
-                    logger.info(f"[ICAO-UPDATE] {mat}: ICAO24 actualizado de '{db_icao}' a '{icao24}'")
-                    db.set_setting(f"icao_{mat}", icao24)  # Log del cambio
-                    with db.connection_scope() as conn:
-                        cursor = db.get_cursor(conn)
-                        cursor.execute(
-                            "UPDATE aeronaves SET icao24 = ? WHERE matricula = ?" if not db.is_postgres else "UPDATE aeronaves SET icao24 = %s WHERE matricula = %s",
-                            (icao24, mat)
-                        )
+                    # Evitar guardar placeholders como ICAO24 real
+                    if icao24 != "e00000" and icao24 != "000000" and not re.match(r'^e000[0-9a-f]{2}$', icao24):
+                        logger.info(f"[ICAO-UPDATE] {mat}: ICAO24 actualizado de '{db_icao}' a '{icao24}'")
+                        db.set_setting(f"icao_{mat}", icao24)  # Log del cambio
+                        with db.connection_scope() as conn:
+                            cursor = db.get_cursor(conn)
+                            cursor.execute(
+                                "UPDATE aeronaves SET icao24 = ? WHERE matricula = ?" if not db.is_postgres else "UPDATE aeronaves SET icao24 = %s WHERE matricula = %s",
+                                (icao24, mat)
+                            )
                 
                 # Lógica de vuelo (Despegue / Aterrizaje)
                 await self._handle_flight_logic(a_db, ac, now_utc, now_str)
@@ -427,9 +452,11 @@ class Tracker:
                 if (es_mil or tiene_prefijo) and not es_comercial:
                     # Alertar si no es un vuelo comercial común (ej. ARG1234 de Aerolineas)
                     if not (callsign and callsign.startswith("ARG") and re.match(r"^ARG\d{4}$", callsign)):
-                        if db.save_aeronave_candidata(callsign or reg or icao24, icao24, "Argentina", now_str):
-                            label = "MILITAR" if es_mil else "GUBERNAMENTAL"
-                            await self.notificador.alertar_desconocida(callsign or reg or icao24, icao24, f"Argentina ({label})", source=ac.get('source'))
+                        # Evitar guardar placeholders como candidatas
+                        if icao24 != "e00000" and icao24 != "000000" and not re.match(r'^e000[0-9a-f]{2}$', icao24):
+                            if db.save_aeronave_candidata(callsign or reg or icao24, icao24, "Argentina", now_str):
+                                label = "MILITAR" if es_mil else "GUBERNAMENTAL"
+                                await self.notificador.alertar_desconocida(callsign or reg or icao24, icao24, f"Argentina ({label})", source=ac.get('source'))
 
         await self.check_pending_landings()
         return count_total, oficiales_nombres
@@ -530,7 +557,7 @@ class Tracker:
                 "origen_nombre": orig['nombre'], "origen_ciudad": orig['ciudad'], "origen_pais": orig.get('pais', 'Argentina'),
                 "destino_icao": near_icao, "destino_nombre": dest_n, "destino_ciudad": dest_c, "destino_pais": AEROPUERTOS.get(near_icao, {}).get('pais', 'Argentina'),
                 "despegue_utc": vuelo['despegue_utc'], "aterrizaje_utc": now_str, "duracion_min": dur_min,
-                "distancia_km": dist_km, "costo_usd": (dur_min/60)*a_db['costo_hora_usd'],
+                "distancia_km": dist_km, "costo_usd": (dur_min/60)*(a_db.get('costo_hora_usd') or 0),
                 "consumo_fuel_l": (dur_min/60)*(a_db.get('litros_hora_estimado') or 0),
                 "emisiones_co2_kg": (dur_min/60)*(a_db.get('co2_kg_hora_estimado') or 0),
                 "es_internacional": 1 if orig.get('pais', 'Argentina') != AEROPUERTOS.get(near_icao, {}).get('pais', 'Argentina') else 0,
@@ -580,6 +607,9 @@ class Tracker:
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         now_str = now_utc.isoformat()
         
+        # Cargar flota completa UNA sola vez antes del loop
+        flota_completa = db.get_all_aeronaves(solo_activas=False)
+        
         for v in vuelos:
             last_ts = v.get('last_update')
             if not last_ts: continue
@@ -612,6 +642,9 @@ class Tracker:
                         dest_n = parts[0].strip()
                         dest_c = parts[1].strip() if len(parts) > 1 else dest_n
                         
+                        # Buscar aeronave en la flota pre-cargada
+                        aero = next((x for x in flota_completa if x['matricula'] == v['matricula']), None)
+                        
                         # Calculamos los datos completos para el vuelo fantasma
                         v_data = {
                             "matricula": v['matricula'], "icao24": v['icao24'], "callsign": v.get('callsign', ''), 
@@ -624,10 +657,8 @@ class Tracker:
                             "es_internacional": 0, "es_finde": 0, "es_nocturno": 0
                         }
                         
-                        a_db = db.get_all_aeronaves(solo_activas=False)
-                        aero = next((x for x in a_db if x['matricula'] == v['matricula']), None)
                         if aero:
-                            v_data["costo_usd"] = (dur_min/60)*aero['costo_hora_usd']
+                            v_data["costo_usd"] = (dur_min/60)*(aero.get('costo_hora_usd') or 0)
                             v_data["consumo_fuel_l"] = (dur_min/60)*(aero.get('litros_hora_estimado') or 0)
                             v_data["emisiones_co2_kg"] = (dur_min/60)*(aero.get('co2_kg_hora_estimado') or 0)
                             v_data["es_finde"] = 1 if dt_despegue.weekday() >= 5 else 0
@@ -636,8 +667,6 @@ class Tracker:
                         db.save_vuelo(v_data)
                         db.remove_vuelo_activo(v['matricula'])
                         
-                        a_db = db.get_all_aeronaves(solo_activas=False)
-                        aero = next((x for x in a_db if x['matricula'] == v['matricula']), None)
                         if aero:
                             from db import db as db_instance
                             with db_instance.connection_scope() as conn:

@@ -104,8 +104,10 @@ class BotInteractivo:
             msg += "/quitar &lt;matricula&gt; - Dejar de seguir\n\n"
             msg += "🕵️ <b>Cazador Inteligente:</b>\n"
             msg += "/candidatas - Ver hallazgos del cazador\n"
+            msg += "/candidatas excel - Descargar plantilla Excel para reclutar\n"
             msg += "/reclutar &lt;callsign&gt; - Reclutar candidata\n"
             msg += "/reclutar &lt;existente&gt; + &lt;candidata&gt; - Merge hex\n"
+            msg += "/reclutar [archivo Excel] - Envía un archivo .xlsx con caption /reclutar para carga masiva\n"
             msg += "/cancelar - Cancelar proceso de carga\n"
             msg += "/ignorar &lt;callsign&gt; - Lista negra permanente\n"
             msg += "/designorar &lt;callsign&gt; - Sacar de lista negra\n"
@@ -304,7 +306,12 @@ class BotInteractivo:
         if not await self._check_owner(update): return
         uid = update.effective_user.id
         if not context.args:
-            await update.message.reply_text("Uso:\n/reclutar <callsign> — Reclutar candidata nueva\n/reclutar <existente> + <candidata> — Unificar hex de candidata en avión existente")
+            # Iniciar modo de espera para recibir un Excel en un segundo mensaje
+            self.add_process[uid] = {"awaiting_reclutar_file": True}
+            await update.message.reply_text(
+                "📥 Modo carga masiva activado. Envía ahora el archivo .xlsx (no es necesario caption)\n"
+                "o escribe /cancelar para abortar. Si recibo cualquier otro mensaje, cancelaré el proceso."
+            )
             return
         if not self._sanitize_args(context.args):
             await update.message.reply_text("⛔ Formato inválido.")
@@ -457,6 +464,214 @@ class BotInteractivo:
             finally:
                 del self.add_process[uid]
 
+    def _normalize_excel_header(self, value):
+        if value is None:
+            return ""
+        header = str(value).strip().upper()
+        header = header.replace("Ó", "O").replace("Á", "A").replace("É", "E").replace("Í", "I").replace("Ú", "U")
+        header = re.sub(r"\s+", " ", header)
+        if header in ["ORGANISMO", "OPERADOR"]:
+            return "ORG"
+        if header in ["PROVINCIA", "ESTADO", "REGION"]:
+            return "PROV"
+        if header in ["COSTO HORA", "COSTO_HORA", "HORA"]:
+            return "COSTO"
+        if header in ["EMISIONES", "CO2 KG", "CO2 KG/HORA", "EMISIONES CO2", "CO2KG"]:
+            return "CO2"
+        if header in ["HEX", "ICAO"]:
+            return "ICAO24"
+        if header in ["VALOR", "PRICE"]:
+            return "PRECIO"
+        if header in ["COMBUSTIBLE", "FUEL"]:
+            return "LITROS"
+        return header
+
+    def _parse_excel_number(self, value):
+        if value is None:
+            return 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        text = str(value).strip().replace(',', '.')
+        if text == "":
+            return 0.0
+        text = re.sub(r"[^0-9\.-]", "", text)
+        if text in ["", "-", ".", "-.", "-.0"]:
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _build_reclutar_fields(self, row, headers):
+        data = {}
+        for idx, header in enumerate(headers):
+            if header not in ["MATRICULA", "NOMBRE", "ORG", "PROV", "MARCA", "MODELO", "PRECIO", "COSTO", "LITROS", "CO2", "ICAO24"]:
+                continue
+            data[header] = row[idx]
+        return data
+
+    def _process_reclutar_excel(self, filepath):
+        from openpyxl import load_workbook
+
+        workbook = load_workbook(filepath, data_only=True)
+        sheet = workbook.active
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            raise ValueError("El archivo Excel está vacío.")
+
+        headers = [self._normalize_excel_header(cell) for cell in rows[0]]
+        if "MATRICULA" not in headers:
+            raise ValueError("No se encontró la columna MATRICULA en el Excel.")
+
+        stats = {
+            "total": 0,
+            "agregadas": 0,
+            "actualizadas": 0,
+            "omitidas": 0,
+            "errores": 0
+        }
+        errors = []
+
+        for row_index, row in enumerate(rows[1:], start=2):
+            if row is None or all(cell is None or str(cell).strip() == "" for cell in row):
+                continue
+            stats["total"] += 1
+            row_data = self._build_reclutar_fields(row, headers)
+            mat = row_data.get("MATRICULA")
+            if mat is None or str(mat).strip() == "":
+                stats["omitidas"] += 1
+                errors.append(f"Fila {row_index}: MATRICULA vacía.")
+                continue
+
+            matricula = str(mat).strip().upper()
+            nombre = str(row_data.get("NOMBRE") or "").strip()
+            org = str(row_data.get("ORG") or "").strip()
+            prov = str(row_data.get("PROV") or "").strip()
+            marca = str(row_data.get("MARCA") or "").strip()
+            modelo = str(row_data.get("MODELO") or "").strip()
+            precio = self._parse_excel_number(row_data.get("PRECIO"))
+            costo = self._parse_excel_number(row_data.get("COSTO"))
+            litros = self._parse_excel_number(row_data.get("LITROS"))
+            co2 = self._parse_excel_number(row_data.get("CO2"))
+            icao = str(row_data.get("ICAO24") or "").strip().lower()
+            if icao in ["none", "noe", ""]:
+                icao = ""
+
+            try:
+                existing = db.get_aeronave(matricula)
+                payload = {
+                    "matricula": matricula,
+                    "nombre": nombre,
+                    "organismo": org,
+                    "provincia": prov,
+                    "marca": marca,
+                    "modelo": modelo,
+                    "precio_usd": precio,
+                    "costo_hora_usd": costo,
+                    "litros_hora_estimado": litros,
+                    "co2_kg_hora_estimado": co2,
+                    "icao24": icao,
+                    "activa": 1
+                }
+                db.upsert_aeronave(payload)
+                if existing:
+                    stats["actualizadas"] += 1
+                else:
+                    stats["agregadas"] += 1
+
+                with db.connection_scope() as conn:
+                    cursor = db.get_cursor(conn)
+                    cursor.execute("DELETE FROM aeronaves_candidatas WHERE callsign = %s" if db.is_postgres else "DELETE FROM aeronaves_candidatas WHERE callsign = ?", (matricula,))
+            except Exception as exc:
+                stats["errores"] += 1
+                errors.append(f"Fila {row_index} ({matricula}): {exc}")
+
+        return stats, errors
+
+    async def _send_candidatas_template(self, update: Update):
+        try:
+            from openpyxl import Workbook
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Reclutar"
+
+            headers = ["MATRICULA", "NOMBRE", "ORG", "PROV", "MARCA", "MODELO", "PRECIO", "COSTO", "LITROS", "CO2", "ICAO24"]
+            sheet.append(headers)
+            sheet.append(["LV-ABC", "Helicóptero de rescate", "Fuerza Aérea", "Santa Fe", "Airbus", "H145", "$ 1.200.000", "800", "500", "", "abc123"])
+
+            for col in range(1, len(headers) + 1):
+                sheet.column_dimensions[chr(64 + col)].width = 18
+
+            filepath = os.path.join(tempfile.gettempdir(), "reclutar_plantilla.xlsx")
+            workbook.save(filepath)
+
+            with open(filepath, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="reclutar_plantilla.xlsx",
+                    caption="📄 Plantilla lista. Completa las filas y envíala con caption /reclutar para cargar varias aeronaves"
+                )
+            os.remove(filepath)
+        except ImportError:
+            await update.message.reply_text("❌ Error: openpyxl no está instalado. Ejecuta pip install openpyxl")
+        except Exception as e:
+            logger.error(f"[BOT] Error generando plantilla Excel: {e}")
+            await update.message.reply_text("❌ Error generando la plantilla de Excel.")
+
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_owner(update):
+            return
+
+        uid = update.effective_user.id
+        caption = (update.message.caption or "").strip().lower()
+        waiting_state = self.add_process.get(uid, {})
+        # Procesar si el documento tiene caption /reclutar o si el usuario está en modo de espera
+        if "/reclutar" not in caption and not waiting_state.get("awaiting_reclutar_file"):
+            return
+
+        document = update.message.document
+        if not document:
+            await update.message.reply_text("❌ No se encontró ningún archivo en el mensaje.")
+            return
+
+        filename = document.file_name or "archivo.xlsx"
+        if not filename.lower().endswith(".xlsx"):
+            await update.message.reply_text("❌ Solo se admite archivos .xlsx para carga masiva.")
+            return
+
+        await update.message.reply_text("⏳ Descargando y procesando el Excel. Esto puede tardar unos segundos...")
+        try:
+            file_obj = await document.get_file()
+            temp_path = os.path.join(tempfile.gettempdir(), f"reclutar_{int(time.time())}_{document.file_unique_id}.xlsx")
+            await file_obj.download_to_drive(temp_path)
+
+            stats, errors = self._process_reclutar_excel(temp_path)
+            os.remove(temp_path)
+
+            # Si veníamos del modo de espera, limpiar el estado
+            if uid in self.add_process and self.add_process[uid].get("awaiting_reclutar_file"):
+                try:
+                    del self.add_process[uid]
+                except: pass
+
+            msg = "✅ Proceso de reclutamiento finalizado.\n"
+            msg += f"Filas procesadas: {stats['total']}\n"
+            msg += f"Nuevas aeronaves: {stats['agregadas']}\n"
+            msg += f"Actualizaciones: {stats['actualizadas']}\n"
+            msg += f"Omitidas: {stats['omitidas']}\n"
+            msg += f"Errores: {stats['errores']}"
+            if stats.get('errores', 0) == 0:
+                msg += "\n\nSalió todo OK ✅"
+            if errors:
+                msg += "\n\nDetalles de los primeros errores:\n"
+                msg += "\n".join(errors[:5])
+            await update.message.reply_text(msg)
+        except ImportError:
+            await update.message.reply_text("❌ Error: openpyxl no está instalado. Ejecuta pip install openpyxl")
+        except Exception as e:
+            logger.error(f"[BOT] Error procesando Excel de reclutar: {e}")
+            await update.message.reply_text(f"❌ Error procesando el Excel: {e}")
+
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_auth(update): return
         uid = update.effective_user.id
@@ -469,14 +684,21 @@ class BotInteractivo:
                 del self.add_process[uid]
                 await update.message.reply_text("❌ Proceso cancelado.")
                 return
-                
             state = self.add_process[uid]
+            # Si estamos esperando un archivo para /reclutar, cualquier texto distinto de /cancelar cancela
+            if state.get("awaiting_reclutar_file"):
+                try:
+                    del self.add_process[uid]
+                except: pass
+                await update.message.reply_text("❌ Proceso de carga cancelado porque recibí un mensaje de texto en lugar del archivo.")
+                return
+
             step = state["step"]
             field_name = self.add_steps[step]
-            
+
             # Guardar el dato
             state["data"][field_name] = text
-            
+
             # Siguiente paso
             state["step"] += 1
             await self._next_add_step(update, uid)
@@ -499,6 +721,10 @@ class BotInteractivo:
 
     async def candidatas(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_owner(update): return
+        if context.args and context.args[0].lower() == "excel":
+            await self._send_candidatas_template(update)
+            return
+
         cand = db.get_aeronaves_candidatas()
         if not cand:
             await update.message.reply_text("No hay candidatas detectadas por el cazador.")
@@ -763,6 +989,7 @@ class BotInteractivo:
         self.app.add_handler(CommandHandler("cancelar", self.cancelar))
         self.app.add_handler(CommandHandler("quitar", self.quitar))
         self.app.add_handler(CommandHandler("candidatas", self.candidatas))
+        self.app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         self.app.add_handler(CommandHandler("ignorar", self.ignorar))
         self.app.add_handler(CommandHandler("designorar", self.designorar))
         self.app.add_handler(CommandHandler("ignorados", self.ignorados))

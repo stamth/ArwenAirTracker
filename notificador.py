@@ -40,7 +40,8 @@ class Notificador:
         try:
             me = self.twitter_client.get_me()
             if me and me.data: return True
-        except: pass
+        except Exception as e:
+            logger.warning(f"[TWITTER] Falló la verificación de credenciales: {e}")
         return False
 
     async def _send_telegram(self, text):
@@ -125,7 +126,10 @@ class Notificador:
         msg += f"Desde: <b>{v['origen_nombre']}</b>, {v['origen_ciudad']}\n"
         msg += f"Hacia: <b>{v['destino_nombre']}</b>, {v['destino_ciudad']}\n"
         msg += f"⏱️ Duración: {dur_str}\n"
-        msg += f"💵 Gasto est.: ${int(v['costo_usd']):,} USD\n"
+        modelo_avion = f"{aeronave.get('marca', '') or ''} {aeronave.get('modelo', '') or ''}".strip()
+        if not modelo_avion:
+            modelo_avion = "Modelo desconocido"
+        msg += f"✈️ Modelo: <b>{modelo_avion}</b>\n"
         msg += f"ICAO: <code>{v.get('icao24', '?')}</code>\n"
         msg += f"🕒 {now_arg.strftime('%H:%M')} (ARG)"
         
@@ -136,7 +140,7 @@ class Notificador:
             tweet = f"🛬 {aeronave['nombre']} ({mat}) aterrizó en {v['destino_nombre']} ({v['destino_ciudad']})\n"
             tweet += f"🛫 Desde: {v['origen_nombre']} ({v['origen_ciudad']})\n"
             tweet += f"⏱️ {dur_str}\n"
-            tweet += f"💵 ~${int(v['costo_usd']):,} USD estimado\n"
+            tweet += f"✈️ {modelo_avion}\n"
             tweet += f"🕒 {now_arg.strftime('%H:%M')} (ARG)\n"
             tweet += f"#AvionesDeLEstado #Aerobot"
             loop = asyncio.get_event_loop()

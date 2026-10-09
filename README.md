@@ -12,7 +12,7 @@ An advanced, hybrid, multi-source flight tracking bot designed to autonomously m
 ### 🌟 Características Principales
 
 *   **Rastreo Híbrido Multifuente**: Combina en tiempo real 4 APIs diferentes para máxima precisión de cobertura territorial:
-    *   **Airplanes.live** (Barrido geográfico rotativo por zonas).
+    *   **Airplanes.live** (Barrido geográfico rotativo por zonas). *Pausado temporalmente mientras se gestiona el acceso a su API (`AIRPLANES_LIVE_ENABLED` en `tracker.py`).*
     *   **ADSB.fi** (Conos de alta densidad).
     *   **ADSB.lol** (Detección especializada en aeronaves militares).
     *   **OpenSky Network** (Seguimiento prioritario por códigos HEX e históricos).
@@ -69,7 +69,7 @@ python main.py run
 ### 🌟 Key Features
 
 *   **Multi-Source Hybrid Tracking**: Combines 4 different APIs in real time to ensure maximum coverage over the Argentine airspace:
-    *   **Airplanes.live** (Dynamic geographical sweeps by sectors).
+    *   **Airplanes.live** (Dynamic geographical sweeps by sectors). *Temporarily paused while API access is being arranged (`AIRPLANES_LIVE_ENABLED` in `tracker.py`).*
     *   **ADSB.fi** (High-precision local cones).
     *   **ADSB.lol** (Military aviation specialized feeds).
     *   **OpenSky Network** (Priority tracking via HEX codes).
