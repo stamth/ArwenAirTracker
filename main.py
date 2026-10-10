@@ -122,7 +122,8 @@ async def tracker_staggered_task(tracker):
                     tot, ofis = await tracker.process_detected(ac_list)
                     logger.info(f"[RADAR] Paso 1/7: + ADSB.fi (CONO:{cono['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
                 
-                elif i == 1:
+                elif i == 1 and AIRPLANES_LIVE_ENABLED:
+                    # Con las zonas en ADSB.lol este cono sería redundante y suma pedidos (429)
                     cono = conos[idx_cono_lol]
                     ac_list = await tracker.fetch_adsb_lol(lat=cono['lat'], lon=cono['lon'], dist=250)
                     tot, ofis = await tracker.process_detected(ac_list)
