@@ -54,7 +54,7 @@ if USE_RAM_DB:
         USE_RAM_DB = False
 
 from db import db
-from tracker import Tracker
+from tracker import Tracker, AIRPLANES_LIVE_ENABLED
 from notificador import Notificador
 from bot_interactivo import BotInteractivo
 from matriculas import AERONAVES_DATA, MATRICULA_TO_ICAO24
@@ -64,7 +64,8 @@ logger = logging.getLogger("AerobotMain")
 async def tracker_staggered_task(tracker):
     logger.info("[SISTEMA] Hilo del Tracker Escalonado iniciado.")
     
-    # Airplanes.live: Barrido rotativo de 7 zonas (dist=250 NM max permitido por la API)
+    # Barrido rotativo de 7 zonas (dist=250 NM max permitido por la API).
+    # Usa Airplanes.live si está habilitado; si no (acceso solo para feeders desde oct-2026), ADSB.lol.
     # Cobertura total de Argentina: lat -22 a -55, lon -53 a -73
     STEP_SECONDS = 12  # 7 pasos x 12s = 84s + margen para latencia de red
     zonas_live = [
@@ -104,10 +105,15 @@ async def tracker_staggered_task(tracker):
             for i, zona in enumerate(zonas_live):
                 step_start = time.time()
                 
-                # 1. Siempre consultamos la zona correspondiente de Airplanes.live
-                ac_list = await tracker.fetch_airplanes_live(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
+                # 1. Siempre consultamos la zona correspondiente
+                if AIRPLANES_LIVE_ENABLED:
+                    fuente_zona = "Airplanes.live"
+                    ac_list = await tracker.fetch_airplanes_live(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
+                else:
+                    fuente_zona = "ADSB.lol"
+                    ac_list = await tracker.fetch_adsb_lol(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
                 tot, ofis = await tracker.process_detected(ac_list)
-                logger.info(f"[RADAR] Paso {i+1}/7: Airplanes.live (ZONA:{zona['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
+                logger.info(f"[RADAR] Paso {i+1}/7: {fuente_zona} (ZONA:{zona['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
                 
                 # 2. Intercalamos las otras APIs en los primeros 4 pasos
                 if i == 0:
