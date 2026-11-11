@@ -19,16 +19,42 @@ socket.getaddrinfo = forced_ipv4_getaddrinfo
 load_dotenv()
 
 import logging.handlers
+import shutil
 
-# Configuración de logging con rotación horaria en RAM (/dev/shm)
-log_path = "/dev/shm/aerobot_debug.log" if os.name != 'nt' else "debug.log"
+import gzip
+import glob
+
+# Logging en disco: un archivo por día (logs/aerobot.log.AAAA-MM-DD.gz), 90 días de historial.
+# bot_run.log (stdout) queda solo para errores y crasheos.
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_DIAS = 90
+os.makedirs(LOG_DIR, exist_ok=True)
+log_path = os.path.join(LOG_DIR, "aerobot.log")
+
+def _log_rotator(source, dest):
+    with open(source, "rb") as f_in, gzip.open(dest, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out)
+    os.remove(source)
+    # Borrar los días más viejos que LOG_DIAS
+    limite = time.time() - LOG_DIAS * 86400
+    for viejo in glob.glob(os.path.join(LOG_DIR, "aerobot.log.*.gz")):
+        try:
+            if os.path.getmtime(viejo) < limite:
+                os.remove(viejo)
+        except OSError:
+            pass
+
 log_handler = logging.handlers.TimedRotatingFileHandler(
-    log_path, when="H", interval=1, backupCount=24
+    log_path, when="midnight", backupCount=0, encoding="utf-8"
 )
+log_handler.namer = lambda name: name + ".gz"
+log_handler.rotator = _log_rotator
+stdout_handler = logging.StreamHandler(sys.stdout)
+stdout_handler.setLevel(logging.ERROR)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[log_handler, logging.StreamHandler(sys.stdout)]
+    handlers=[log_handler, stdout_handler]
 )
 
 # Silenciar logs ruidosos
@@ -54,7 +80,8 @@ if USE_RAM_DB:
         USE_RAM_DB = False
 
 from db import db
-from tracker import Tracker, AIRPLANES_LIVE_ENABLED
+from tracker import Tracker
+from api_health import health
 from notificador import Notificador
 from bot_interactivo import BotInteractivo
 from matriculas import AERONAVES_DATA, MATRICULA_TO_ICAO24
@@ -64,94 +91,85 @@ logger = logging.getLogger("AerobotMain")
 async def tracker_staggered_task(tracker):
     logger.info("[SISTEMA] Hilo del Tracker Escalonado iniciado.")
     
-    # Barrido rotativo de 7 zonas (dist=250 NM max permitido por la API).
-    # Usa Airplanes.live si está habilitado; si no (acceso solo para feeders desde oct-2026), ADSB.lol.
+    # Barrido rotativo de 8 zonas con ADSB.fi (dist=250 NM max permitido por la API).
+    # ADSB.lol queda solo para militares (límite 500 pedidos/día) y OpenSky para la flota conocida.
     # Cobertura total de Argentina: lat -22 a -55, lon -53 a -73
-    STEP_SECONDS = 12  # 7 pasos x 12s = 84s + margen para latencia de red
-    zonas_live = [
+    STEP_SECONDS = 11  # 8 pasos x 11s = 88s, dentro del ciclo de 90s
+    MIL_CADA_CICLOS = 6  # ~9 min -> ~160 pedidos/día a ADSB.lol (/v2/mil)
+    HEX_LOL_CADA_CICLOS = 6  # ~9 min -> ~160 pedidos/día a ADSB.lol (/v2/hex conocidos). Total ~320 de 500.
+    zonas = [
         {"nombre": "NOA",             "lat": -24.0, "lon": -65.0, "dist": 250},  # Jujuy, Salta, Tucumán, Catamarca
         {"nombre": "NEA",             "lat": -28.0, "lon": -56.0, "dist": 250},  # Misiones, Corrientes, Formosa, Chaco
         {"nombre": "CENTRO",          "lat": -33.0, "lon": -63.0, "dist": 250},  # Córdoba, Santa Fe, Entre Ríos, San Luis
-        {"nombre": "AMBA/CUYO",       "lat": -34.0, "lon": -67.5, "dist": 250},  # Buenos Aires, Mendoza, San Juan, La Pampa
+        {"nombre": "CUYO",            "lat": -34.0, "lon": -67.5, "dist": 250},  # Mendoza, San Juan, La Pampa
+        {"nombre": "AMBA",            "lat": -35.0, "lon": -58.5, "dist": 250},  # AMBA, La Plata, Rosario, costa atlántica (antes lo cubría el cono de ADSB.fi)
         {"nombre": "PATAGONIA NORTE", "lat": -41.0, "lon": -68.0, "dist": 250},  # Neuquén, Río Negro
         {"nombre": "PATAGONIA SUR",   "lat": -49.0, "lon": -69.0, "dist": 250},  # Santa Cruz, Chubut sur
         {"nombre": "TIERRA DEL FUEGO","lat": -54.5, "lon": -68.0, "dist": 250},  # Ushuaia, TdF, Atlántico Sur
     ]
     
-    # Conos de precisión para ADSB.fi / ADSB.lol (Alta eficiencia en zonas clave)
-    conos = [
-        {"nombre": "AMBA/CENTRO", "lat": -34.6, "lon": -58.5},
-        {"nombre": "CORDOBA/NORTE", "lat": -31.3, "lon": -64.2},
-        {"nombre": "PATAGONIA/ANDES", "lat": -41.1, "lon": -71.3}
-    ]
-    
+    def _pausa(api):
+        return " [EN PAUSA]" if health.esta_pausada(api) else ""
+
     iteration = 0
     while True:
         try:
             start_time = time.time()
             iteration += 1
+            health.iniciar_ciclo(iteration)
             
             logger.info(f"=== INICIANDO BARRIDO GLOBAL N° {iteration} ===")
             
             # Obtener lista de aviones conocidos para búsquedas HEX
             flota = db.get_all_aeronaves(solo_activas=True)
             icao_list = [a['icao24'] for a in flota if a['icao24']]
+            # Hex alternativos del ARG-01 (capturados por callsign ARG01) tambien se consultan en todo el mundo
+            icao_list += [h for h in db.get_alt_hexes("ARG-01") if h not in icao_list]
             
-            # Conos rotativos para las APIs secundarias
-            idx_cono_fi = (iteration - 1) % 3
-            idx_cono_lol = iteration % 3
-            
-            # Bucle interno: Barremos las 7 zonas de Airplanes.live en pasos de 13 segundos
-            for i, zona in enumerate(zonas_live):
+            for i, zona in enumerate(zonas):
                 step_start = time.time()
                 
-                # 1. Siempre consultamos la zona correspondiente
-                if AIRPLANES_LIVE_ENABLED:
-                    fuente_zona = "Airplanes.live"
-                    ac_list = await tracker.fetch_airplanes_live(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
-                else:
-                    fuente_zona = "ADSB.lol"
-                    ac_list = await tracker.fetch_adsb_lol(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
+                # 1. Zona del paso con ADSB.fi
+                ac_list = await tracker.fetch_adsb_fi(lat=zona['lat'], lon=zona['lon'], dist=zona['dist'])
                 tot, ofis = await tracker.process_detected(ac_list)
-                logger.info(f"[RADAR] Paso {i+1}/7: {fuente_zona} (ZONA:{zona['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
+                logger.info(f"[RADAR] Paso {i+1}/{len(zonas)}: ADSB.fi (ZONA:{zona['nombre']}) -> {tot} aviones ({len(ofis)} ofis){_pausa('ADSB.fi')}")
                 
-                # 2. Intercalamos las otras APIs en los primeros 4 pasos
-                if i == 0:
-                    cono = conos[idx_cono_fi]
-                    ac_list = await tracker.fetch_adsb_fi(lat=cono['lat'], lon=cono['lon'], dist=250)
-                    tot, ofis = await tracker.process_detected(ac_list)
-                    logger.info(f"[RADAR] Paso 1/7: + ADSB.fi (CONO:{cono['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
-                
-                elif i == 1 and AIRPLANES_LIVE_ENABLED:
-                    # Con las zonas en ADSB.lol este cono sería redundante y suma pedidos (429)
-                    cono = conos[idx_cono_lol]
-                    ac_list = await tracker.fetch_adsb_lol(lat=cono['lat'], lon=cono['lon'], dist=250)
-                    tot, ofis = await tracker.process_detected(ac_list)
-                    logger.info(f"[RADAR] Paso 2/7: + ADSB.lol (CONO:{cono['nombre']}) -> {tot} aviones ({len(ofis)} ofis)")
-                
-                elif i == 2:
+                # 2. Intercalamos las otras APIs
+                if i == 2 and iteration % MIL_CADA_CICLOS == 1:
                     ac_list = await tracker.fetch_adsb_lol_mil()
                     tot, ofis = await tracker.process_detected(ac_list)
-                    logger.info(f"[RADAR] Paso 3/7: + ADSB.lol (MIL) -> {tot} aviones ({len(ofis)} ofis)")
+                    logger.info(f"[RADAR] Paso 3: + ADSB.lol (MIL) -> {tot} aviones ({len(ofis)} ofis){_pausa('ADSB.lol-MIL')}")
                 
                 elif i == 3:
                     ac_list_live = await tracker.fetch_airplanes_live_hex(icao_list)
-                    tot_live, ofis_live = await tracker.process_detected(ac_list_live)
-                    logger.info(f"[RADAR] Paso 4/7: + Airplanes.live-HEX (CONOCIDOS) -> {tot_live} aviones ({len(ofis_live)} ofis)")
+                    if ac_list_live:
+                        tot_live, ofis_live = await tracker.process_detected(ac_list_live)
+                        logger.info(f"[RADAR] Paso 4: + Airplanes.live-HEX (CONOCIDOS) -> {tot_live} aviones ({len(ofis_live)} ofis)")
                     
                     ac_list_os = await tracker.fetch_opensky(icao24_list=icao_list)
                     if ac_list_os is not None:
                         tot_os, ofis_os = await tracker.process_detected(ac_list_os)
-                        logger.info(f"[RADAR] Paso 4/7: + OpenSky (CONOCIDOS) -> {tot_os} aviones ({len(ofis_os)} ofis)")
+                        logger.info(f"[RADAR] Paso 4: + OpenSky (CONOCIDOS) -> {tot_os} aviones ({len(ofis_os)} ofis)")
+                    elif health.esta_pausada("OpenSky"):
+                        logger.info("[RADAR] Paso 4: + OpenSky (CONOCIDOS) -> [EN PAUSA]")
+
+                elif i == 6 and iteration % HEX_LOL_CADA_CICLOS == 4:
+                    # Segunda fuente mundial de conocidos (reemplaza Airplanes.live-HEX)
+                    ac_list_lol = await tracker.fetch_adsb_lol_hex(icao_list)
+                    tot_l, ofis_l = await tracker.process_detected(ac_list_lol)
+                    logger.info(f"[RADAR] Paso 7: + ADSB.lol-HEX (CONOCIDOS) -> {tot_l} aviones ({len(ofis_l)} ofis){_pausa('ADSB.lol-HEX')}")
                 
-                # Esperamos hasta cumplir los 13 segundos del paso actual
+                # Esperamos hasta cumplir los segundos del paso actual
                 elapsed_step = time.time() - step_start
                 sleep_time = max(0, STEP_SECONDS - elapsed_step)
                 await asyncio.sleep(sleep_time)
             
+            health.cerrar_ciclo()
+            
             # Purga cada 10 ciclos
             if iteration % 10 == 0:
                 purged_smart = await tracker.check_ghost_landings()
+                await tracker.avisar_vuelos_colgados(horas=8)
                 count = db.purge_ghost_vuelos(horas=8)
                 if count > 0 or purged_smart > 0: 
                     logger.info(f"[DB] Purgados {count} vuelos colgados y {purged_smart} aterrizajes inteligentes.")
@@ -160,7 +178,8 @@ async def tracker_staggered_task(tracker):
             if iteration % 1000 == 0:
                 pos_borradas = db.purge_old_positions(days=15)
                 cand_borradas = db.purge_old_candidatas(hours=72)
-                logger.info(f"[DB-MANTENIMIENTO] Borradas {pos_borradas} posiciones antiguas del disco y {cand_borradas} candidatas expiradas.")
+                err_borrados = db.purge_old_api_errores(days=90)
+                logger.info(f"[DB-MANTENIMIENTO] Borradas {pos_borradas} posiciones antiguas del disco, {cand_borradas} candidatas expiradas y {err_borrados} errores de API de más de 90 días.")
 
             # Heartbeat cada 10 ciclos (~15 minutos)
             if iteration % 10 == 0:
@@ -264,10 +283,11 @@ async def run_bot_and_tracker():
     
     notificador = Notificador()
     tracker = Tracker(notificador)
+    health.set_notificador(notificador)
     bot = BotInteractivo()
     
     # Alerta de Inicio en Telegram
-    await notificador.alertar_especial("🚀 <b>ARWEN AIR TRACKER ONLINE</b>\n\nEl sistema híbrido de rastreo ha comenzado a operar.\nModo: Rotación Cruzada (N/S)\nFuentes: 4 APIs Activas")
+    await notificador.alertar_especial("🚀 <b>ARWEN AIR TRACKER ONLINE</b>\n\nEl sistema híbrido de rastreo ha comenzado a operar.\nModo: Rotación Cruzada (N/S)\nFuentes: ADSB.fi (zonas), ADSB.lol (militares), OpenSky (conocidos)")
     
     tasks = [
         asyncio.create_task(tracker_staggered_task(tracker)), 
@@ -309,6 +329,11 @@ async def run_bot_and_tracker():
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("[SISTEMA] Parada solicitada. Apagando...")
     finally:
+        try:
+            await tracker.aclose()
+        except Exception:
+            pass
+        logger.info("[SISTEMA] Bot apagado.")
         if USE_RAM_DB:
             logger.info("[SISTEMA] Sincronización FINAL de DB a Disco antes de salir (incluye apagados por señal SIGTERM/SIGINT)...")
             db.backup_to_disk(DB_ORIGINAL)

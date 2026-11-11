@@ -34,3 +34,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# Backups locales
+*.bak
+*.bak-*

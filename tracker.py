@@ -9,6 +9,7 @@ from geopy.distance import distance as geopy_distance
 from geopy.geocoders import Nominatim
 from db import db
 from aeropuertos import AEROPUERTOS
+from api_health import health, clasificar_status, clasificar_excepcion
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,8 @@ AIRPLANES_LIVE_ENABLED = False
 
 TOURIST_DESTINATIONS = {"Bariloche", "Iguazú", "El Calafate", "Ushuaia", "Punta del Este"}
 OFFICIAL_PREFIXES = ("LQ", "ARG", "PG", "GN", "AE", "PA")
+# Aeronaves que solo se reconocen por hex. Matricula/callsign con otro hex -> aviso al dueño, no se registra.
+HEX_BLOQUEADO = ("ARG-01", "ARG-01-ALT")
 COMMERCIAL_PREFIXES = ("LV", "LVL", "LVS", "AEA", "DSM", "IBE", "AAL", "UAL", "DAL", "AFR", "BAW", "DLH", "TAM", "GLO", "AZU", "CMP", "AVA", "BOV")
 
 OPENSKY_TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
@@ -28,7 +31,8 @@ class OpenSkyTokenManager:
     Maneja el token OAuth2 de OpenSky automáticamente.
     Los tokens duran 30 minutos. Esta clase los renueva solos.
     """
-    def __init__(self):
+    def __init__(self, client_getter=None):
+        self._client_getter = client_getter
         self.client_id     = os.environ.get("OPENSKY_CLIENT_ID", "")
         self.client_secret = os.environ.get("OPENSKY_CLIENT_SECRET", "")
         self._token        = None
@@ -48,27 +52,27 @@ class OpenSkyTokenManager:
         if not self.is_configured():
             return None
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.post(
-                    OPENSKY_TOKEN_URL,
-                    data={
-                        "grant_type":    "client_credentials",
-                        "client_id":     self.client_id,
-                        "client_secret": self.client_secret,
-                    },
-                    timeout=10.0
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    self._token      = data["access_token"]
-                    expires_in       = data.get("expires_in", 1800)
-                    self._expires_at = time.time() + expires_in
-                    logger.info(f"[OPENSKY] Token OAuth2 renovado. Expira en {expires_in}s.")
-                    return self._token
-                elif r.status_code == 401:
-                    logger.error("[OPENSKY] OAuth2: client_id o client_secret inválidos.")
-                else:
-                    logger.error(f"[OPENSKY] OAuth2: Error al obtener token ({r.status_code}): {r.text[:200]}")
+            client = self._client_getter()
+            r = await client.post(
+                OPENSKY_TOKEN_URL,
+                data={
+                    "grant_type":    "client_credentials",
+                    "client_id":     self.client_id,
+                    "client_secret": self.client_secret,
+                },
+                timeout=10.0
+            )
+            if r.status_code == 200:
+                data = r.json()
+                self._token      = data["access_token"]
+                expires_in       = data.get("expires_in", 1800)
+                self._expires_at = time.time() + expires_in
+                logger.info(f"[OPENSKY] Token OAuth2 renovado. Expira en {expires_in}s.")
+                return self._token
+            elif r.status_code == 401:
+                logger.error("[OPENSKY] OAuth2: client_id o client_secret inválidos.")
+            else:
+                logger.error(f"[OPENSKY] OAuth2: Error al obtener token ({r.status_code}): {r.text[:200]}")
         except Exception as e:
             logger.error(f"[OPENSKY] OAuth2: Excepción al renovar token: {e}")
         self._token = None
@@ -89,8 +93,8 @@ class Tracker:
             "Norte": {"total": set(), "gov": set()},
             "Sur": {"total": set(), "gov": set()}
         }
-        self.opensky_tokens = OpenSkyTokenManager()
-        self.opensky_blocked_until = 0
+        self._http = None
+        self.opensky_tokens = OpenSkyTokenManager(client_getter=self._client)
         self.geolocator = Nominatim(user_agent="ArwenAirTracker")
         self.pending_landings = {}  # {matricula: {"first_seen": timestamp, "ac": ac, "vuelo": vuelo_db, "a_db": a_db}}
 
@@ -99,6 +103,28 @@ class Tracker:
         return re.sub(r'[\s\-]', '', text).upper()
 
     # --- FETCHERS ---
+
+    def _client(self):
+        """Una sola conexión HTTP reusada para todas las APIs (keep-alive)."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(headers={"User-Agent": "ArwenAirTracker/1.0"}, timeout=15.0)
+        return self._http
+
+    async def aclose(self):
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+
+    def _respuesta_error(self, api, r):
+        """Registra una respuesta HTTP no exitosa en la salud de la API."""
+        tipo = clasificar_status(r.status_code)
+        retry = (r.headers.get("X-Rate-Limit-Retry-After-Seconds")
+                 or r.headers.get("Retry-After")
+                 or (r.headers.get("x-ratelimit-reset") if r.status_code == 429 else None))
+        try:
+            retry = int(float(retry)) if retry else None
+        except ValueError:
+            retry = None
+        health.error(api, tipo, f"HTTP {r.status_code} {r.text[:120].strip()}", retry_after=retry)
 
     async def fetch_airplanes_live(self, lat=-35.0, lon=-64.0, dist=1500):
         """Usa Airplanes.live con punto y radio (más liviano)"""
@@ -151,67 +177,139 @@ class Tracker:
         return []
 
     async def fetch_adsb_fi(self, lat=-35.0, lon=-64.0, dist=250):
-        """Usa ADSB.fi con punto y radio (v3) - Max dist 250 NM"""
-        # ADSB.fi v3 requiere lat/lon/dist en el path
+        """Usa ADSB.fi con punto y radio (v3) - Max dist 250 NM. Fuente principal de las zonas."""
+        api = "ADSB.fi"
+        if health.esta_pausada(api):
+            return []
         dist = min(dist, 250)
         url = f"https://opendata.adsb.fi/api/v3/lat/{lat}/lon/{lon}/dist/{dist}"
-        headers = {"User-Agent": "ArwenAirTracker/1.0"}
         try:
-            async with httpx.AsyncClient(headers=headers) as client:
-                r = await client.get(url, timeout=15.0)
-                if r.status_code == 200:
-                    data = r.json().get("ac") or []
-                    return self._parse_adsb_exchange(data, bbox=None, source="ADSB.fi")
-                else:
-                    logger.warning(f"[ADSB.FI] Error {r.status_code} en {url}")
+            r = await self._client().get(url, timeout=15.0)
+            if r.status_code == 200:
+                data = r.json().get("ac") or []
+                res = self._parse_adsb_exchange(data, bbox=None, source="ADSB.fi")
+                health.ok(api, len(res))
+                return res
+            self._respuesta_error(api, r)
         except Exception as e:
-            logger.error(f"[ADSB.FI] Error: {type(e).__name__} - {e}")
+            health.error(api, clasificar_excepcion(e), f"{type(e).__name__} {e}")
         return []
 
     async def fetch_adsb_lol(self, lat=-35.0, lon=-64.0, dist=250):
-        """Usa ADSB.lol con punto y radio - Max dist 250 NM"""
+        """Usa ADSB.lol con punto y radio - Max dist 250 NM (sin uso: el límite es 500 pedidos/día)"""
         dist = min(dist, 250)
         url = f"https://api.adsb.lol/v2/lat/{lat}/lon/{lon}/dist/{dist}"
-        headers = {"User-Agent": "ArwenAirTracker/1.0"}
         try:
-            async with httpx.AsyncClient(headers=headers) as client:
-                r = await client.get(url, timeout=15.0)
-                if r.status_code == 200:
-                    data = r.json().get("ac") or []
-                    return self._parse_adsb_exchange(data, bbox=None, source="ADSB.lol")
-                else:
-                    logger.warning(f"[ADSB.LOL] Error {r.status_code} en {url}")
+            r = await self._client().get(url, timeout=15.0)
+            if r.status_code == 200:
+                data = r.json().get("ac") or []
+                return self._parse_adsb_exchange(data, bbox=None, source="ADSB.lol")
+            else:
+                logger.warning(f"[ADSB.LOL] Error {r.status_code} en {url}")
         except Exception as e:
             logger.error(f"[ADSB.LOL] Error: {type(e).__name__} - {e}")
         return []
 
     async def fetch_adsb_lol_mil(self):
         """Usa ADSB.lol para detectar exclusivamente aeronaves militares"""
+        api = "ADSB.lol-MIL"
+        if health.esta_pausada(api):
+            return []
         url = "https://api.adsb.lol/v2/mil"
         bbox_arg = (-56.0, -75.0, -22.0, -52.0) # Argentina Completa
-        headers = {"User-Agent": "ArwenAirTracker/1.0"}
         try:
-            async with httpx.AsyncClient(headers=headers) as client:
-                r = await client.get(url, timeout=15.0)
-                if r.status_code == 200:
-                    data = r.json().get("ac") or []
-                    return self._parse_adsb_exchange(data, bbox_arg, source="ADSB.lol-MIL")
-                else:
-                    logger.warning(f"[ADSB.LOL-MIL] Error {r.status_code} en {url}")
+            r = await self._client().get(url, timeout=15.0)
+            restantes = r.headers.get("x-ratelimit-remaining")
+            if restantes is not None:
+                health.set_restantes(api, restantes)
+            if r.status_code == 200:
+                data = r.json().get("ac") or []
+                todos = self._parse_adsb_exchange(data, None, source="ADSB.lol-MIL")
+                conocidos = self._known_hexes()
+                regs = {self._normalize_text(x["matricula"]) for x in db.get_all_aeronaves(solo_activas=True)}
+                res = [a for a in todos if a["hex"] in conocidos or self._normalize_text(a["reg"]) in regs or
+                       (bbox_arg[0] <= a["lat"] <= bbox_arg[2] and bbox_arg[1] <= a["lon"] <= bbox_arg[3])]
+                health.ok(api, len(res))
+                # Si avisa que no quedan pedidos, frenar hasta que se libere en vez de comerse el 429
+                if restantes == "0":
+                    try:
+                        reset = int(float(r.headers.get("x-ratelimit-reset", 0)))
+                    except ValueError:
+                        reset = 0
+                    if reset > 0:
+                        health.pausa_preventiva(api, reset, "sin pedidos restantes")
+                return res
+            self._respuesta_error(api, r)
         except Exception as e:
-            logger.error(f"[ADSB.LOL-MIL] Error: {type(e).__name__} - {e}")
+            health.error(api, clasificar_excepcion(e), f"{type(e).__name__} {e}")
         return []
+
+    def _known_hexes(self):
+        """Hex validos de la flota activa + alternativos del ARG-01."""
+        hs = set()
+        for a in db.get_all_aeronaves(solo_activas=True):
+            h = (a.get("icao24") or "").lower().strip()
+            if h and h not in ("e00000", "000000") and not re.match(r"^e000[0-9a-f]{2}$", h):
+                hs.add(h)
+        hs.update(db.get_alt_hexes("ARG-01"))
+        return hs
+
+    async def fetch_adsb_lol_hex(self, icao24_list):
+        """ADSB.lol por hex (muchos en un pedido): segunda fuente mundial para la flota conocida."""
+        api = "ADSB.lol-HEX"
+        if health.esta_pausada(api):
+            return []
+        hexes = [h.lower() for h in icao24_list if h and len(h) == 6 and h.lower() not in ("e00000", "000000")
+                 and not re.match(r"^e000[0-9a-f]{2}$", h.lower())]
+        if not hexes:
+            return []
+        url = "https://api.adsb.lol/v2/hex/" + ",".join(dict.fromkeys(hexes))
+        try:
+            r = await self._client().get(url, timeout=15.0)
+            restantes = r.headers.get("x-ratelimit-remaining")
+            if restantes is not None:
+                health.set_restantes(api, restantes)
+            if r.status_code == 200:
+                data = r.json().get("ac") or []
+                res = self._parse_adsb_exchange(data, None, source="ADSB.lol-HEX")
+                health.ok(api, len(res))
+                return res
+            self._respuesta_error(api, r)
+        except Exception as e:
+            health.error(api, clasificar_excepcion(e), f"{type(e).__name__} {e}")
+        return []
+
+    async def avisar_vuelos_colgados(self, horas=8):
+        """Antes de purgar vuelos sin señal hace X horas, aviso privado al dueño (no al canal)."""
+        limite = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=horas)
+        for v in db.get_vuelos_activos():
+            try:
+                lu = datetime.datetime.fromisoformat(v["last_update"])
+                if lu.tzinfo is None: lu = lu.replace(tzinfo=datetime.timezone.utc)
+                if lu >= limite: continue
+                near_icao, dist_km = self.find_nearest_airport(v["last_lat"], v["last_lon"])
+                ap = AEROPUERTOS.get(near_icao, {}).get("nombre", near_icao)
+                hora = (lu - datetime.timedelta(hours=3)).strftime("%d/%m %H:%M")
+                alt = int(float(v.get("last_alt") or 0))
+                msg = f"📡 <b>Vuelo sin cierre: {v['matricula']}</b>\n\n"
+                msg += f"Perdió señal a {alt} ft, a {dist_km:.0f} km de {ap}.\n"
+                msg += f"Último dato: {hora} (ARG) · posición {v['last_lat']:.3f}, {v['last_lon']:.3f}\n"
+                msg += f"Despegó de {v.get('origen_nombre','?')}. No pude confirmar el aterrizaje: lo saco de vuelos activos."
+                logger.info(f"[COLGADO] {v['matricula']} sin señal desde {hora} ARG, aviso al dueño antes de purgar.")
+                await self.notificador._send_owner(msg)
+            except Exception as e:
+                logger.error(f"[COLGADO] Error avisando {v.get('matricula')}: {e}")
 
     async def fetch_opensky(self, icao24_list=None):
         """
         Consulta OpenSky con OAuth2 para aeronaves conocidas.
-        - Respeta cooldown de 15 min si recibe 429
+        Las pausas por 429/403/etc. las maneja api_health (espera creciente, máx 60 min).
         """
+        api = "OpenSky"
         if not icao24_list:
             return []
 
-        # Verificar cooldown
-        if time.time() < self.opensky_blocked_until:
+        if health.esta_pausada(api):
             return None
 
         # Verificar si OAuth2 está configurado
@@ -227,41 +325,29 @@ class Tracker:
 
         try:
             headers = await self.opensky_tokens.headers()
-            async with httpx.AsyncClient() as client:
-                r = await client.get(OPENSKY_API_URL, params=params, headers=headers, timeout=20.0)
-                
-                # Mostrar créditos restantes si están disponibles
-                remaining_credits = r.headers.get("X-Rate-Limit-Remaining")
-                if remaining_credits:
-                    logger.info(f"[OPENSKY] ✅ Respuesta OK. Créditos restantes: {remaining_credits}")
+            r = await self._client().get(OPENSKY_API_URL, params=params, headers=headers, timeout=20.0)
 
-                if r.status_code == 200:
-                    states = r.json().get("states") or []
-                    return self._parse_opensky(states)
+            # Mostrar créditos restantes si están disponibles
+            remaining_credits = r.headers.get("X-Rate-Limit-Remaining")
+            if remaining_credits:
+                health.set_restantes(api, remaining_credits)
+                logger.info(f"[OPENSKY] ✅ Respuesta OK. Créditos restantes: {remaining_credits}")
 
-                elif r.status_code == 401:
-                    logger.warning("[OPENSKY] 401: Token expirado o inválido. Forzando renovación.")
-                    self.opensky_tokens._token = None
-                    self.opensky_tokens._expires_at = 0
-                    return None
+            if r.status_code == 200:
+                states = r.json().get("states") or []
+                res = self._parse_opensky(states)
+                health.ok(api, len(res))
+                return res
 
-                elif r.status_code == 429:
-                    retry_after = int(r.headers.get("X-Rate-Limit-Retry-After-Seconds", 900))
-                    self.opensky_blocked_until = time.time() + retry_after
-                    logger.warning(f"[OPENSKY] 429: Límite de créditos. Cooldown de {retry_after}s activado.")
-                    return None
-
-                elif r.status_code == 403:
-                    logger.error("[OPENSKY] 403: Acceso denegado. Verificar permisos del API client.")
-                    self.opensky_blocked_until = time.time() + 3600
-                    return None
-
-                else:
-                    logger.warning(f"[OPENSKY] HTTP {r.status_code}")
-                    return None
+            if r.status_code == 401:
+                # Forzar renovación del token para el próximo intento
+                self.opensky_tokens._token = None
+                self.opensky_tokens._expires_at = 0
+            self._respuesta_error(api, r)
+            return None
 
         except Exception as e:
-            logger.error(f"[OPENSKY] Error: {e}")
+            health.error(api, clasificar_excepcion(e), f"{type(e).__name__} {e}")
             return None
 
     async def verify_auth(self):
@@ -276,22 +362,21 @@ class Tracker:
             return "INVALID"
 
         try:
-            async with httpx.AsyncClient() as client:
-                r = await client.get(
-                    OPENSKY_API_URL,
-                    params=[("icao24", "e14d34")],  # ARG-03
-                    headers={"Authorization": f"Bearer {token}", "User-Agent": "ArwenAirTracker/1.0"},
-                    timeout=10.0
-                )
-                if r.status_code == 200:
-                    credits_left = r.headers.get("X-Rate-Limit-Remaining", "?")
-                    logger.info(f"[OPENSKY] Auth OK. Créditos disponibles: {credits_left}")
-                    return "OK"
-                if r.status_code == 401:
-                    return "INVALID"
-                if r.status_code == 429:
-                    return "RATE_LIMIT"
-                return f"HTTP_{r.status_code}"
+            r = await self._client().get(
+                OPENSKY_API_URL,
+                params=[("icao24", "e14d34")],  # ARG-03
+                headers={"Authorization": f"Bearer {token}", "User-Agent": "ArwenAirTracker/1.0"},
+                timeout=10.0
+            )
+            if r.status_code == 200:
+                credits_left = r.headers.get("X-Rate-Limit-Remaining", "?")
+                logger.info(f"[OPENSKY] Auth OK. Créditos disponibles: {credits_left}")
+                return "OK"
+            if r.status_code == 401:
+                return "INVALID"
+            if r.status_code == 429:
+                return "RATE_LIMIT"
+            return f"HTTP_{r.status_code}"
         except Exception as e:
             logger.error(f"[OPENSKY] verify_auth error: {e}")
             return "ERROR"
@@ -338,6 +423,7 @@ class Tracker:
                 "hex": str(ac.get("hex", "")).lower(),
                 "reg": str(ac.get("r", "")).strip().upper(),
                 "callsign": str(ac.get("flight", "")).strip().upper(),
+                "desc": str(ac.get("desc") or "").strip(),
                 "lat": lat, "lon": lon,
                 "alt": alt,
                 "on_ground": on_ground,
@@ -359,7 +445,7 @@ class Tracker:
                 continue
                 
             alt_raw = s[7]
-            try: alt = float(alt_raw) if alt_raw is not None else 0.0
+            try: alt = float(alt_raw) * 3.28084 if alt_raw is not None else 0.0  # OpenSky da metros -> pies
             except (ValueError, TypeError): alt = 0.0
             
             vel_raw = s[9]
@@ -398,6 +484,9 @@ class Tracker:
         # Mapa adicional por nombre (para matchear callsigns como "Cruz Del Sur")
         watchlist_call = {self._normalize_text(a['nombre']): a for a in flota_db if a.get('nombre')}
         
+        # Hex alternativos del ARG-01 (aviones que usa el presidente). Valen solo con callsign ARG01.
+        alt_hexes = set(db.get_alt_hexes("ARG-01"))
+        alt_row = next((a for a in flota_db if a["matricula"] == "ARG-01-ALT"), None)
         count_total = len(aircraft_list)
         oficiales_nombres = []
         
@@ -416,6 +505,42 @@ class Tracker:
             a_db = watchlist_hex.get(icao24) or \
                    watchlist_reg.get(self._normalize_text(reg)) or \
                    watchlist_call.get(self._normalize_text(callsign))
+
+            # Avion alternativo: hex en la lista + callsign ARG01 (o vacio, el feed a veces no lo manda).
+            # Si vuela con otro callsign, el presidente ya no esta ahi: se saca de la lista.
+            es_alt = False
+            if icao24 in alt_hexes and icao24 not in watchlist_hex and alt_row:
+                cs_norm = self._normalize_text(callsign)
+                if cs_norm and cs_norm != "ARG01":
+                    alt_hexes.discard(icao24)
+                    db.set_alt_hexes(alt_hexes, "ARG-01")
+                    logger.info(f"[HEX] {icao24} vuela como {callsign}: sacado de alternativos del ARG-01")
+                    await self.notificador.alertar_alt_removido(icao24, callsign)
+                else:
+                    es_alt = True
+                    a_db = alt_row
+
+            # ARG-01: solo por hex. Si aparece su matricula o el callsign ARG01 con otro hex, avisar y no registrar.
+            hex_conocido = icao24 in watchlist_hex or es_alt
+            # Captura automatica: callsign ARG01 con hex desconocido -> se suma a alternativos y se sigue
+            if (not hex_conocido and alt_row and self._normalize_text(callsign) == "ARG01"
+                    and icao24 and icao24 != "000000" and not re.match(r"^e000[0-9a-f]{2}$", icao24)):
+                alt_hexes.add(icao24)
+                db.set_alt_hexes(alt_hexes, "ARG-01")
+                logger.info(f"[HEX] {icao24} vuela como ARG01: capturado como alternativo del ARG-01 (reg={reg}, fuente={ac.get('source')})")
+                await self.notificador.alertar_alt_capturado(icao24, callsign, reg, ac.get("desc", ""), ac.get("source"))
+                es_alt = True
+                hex_conocido = True
+                a_db = alt_row
+            hex_conocido = icao24 in watchlist_hex or es_alt
+            if not hex_conocido and ((a_db and a_db["matricula"] in HEX_BLOQUEADO) or
+                                     (not a_db and self._normalize_text(callsign) == "ARG01")):
+                if icao24 and icao24 != "000000" and not re.match(r"^e000[0-9a-f]{2}$", icao24):
+                    await self.notificador.alertar_hex_distinto("ARG-01", icao24, callsign, reg, ac.get("desc", ""), ac.get("source"))
+                continue
+            if a_db and a_db["matricula"] == "ARG-01-ALT" and ac.get("desc"):
+                # Avion alternativo: el modelo lo da el feed
+                a_db = dict(a_db, marca="", modelo=ac["desc"])
             
             if a_db:
                 mat = a_db['matricula']
@@ -425,7 +550,7 @@ class Tracker:
                 
                 # AUTO-UPDATE: Si lo detectamos por registro/callsign pero su ICAO24 cambió o faltaba, actualizar
                 db_icao = (a_db.get('icao24') or '').lower()
-                if icao24 and icao24 != db_icao:
+                if icao24 and icao24 != db_icao and mat not in HEX_BLOQUEADO and not db.get_setting(f"hex_{mat}"):
                     # Evitar guardar placeholders como ICAO24 real
                     if icao24 != "e00000" and icao24 != "000000" and not re.match(r'^e000[0-9a-f]{2}$', icao24):
                         logger.info(f"[ICAO-UPDATE] {mat}: ICAO24 actualizado de '{db_icao}' a '{icao24}'")
@@ -448,6 +573,9 @@ class Tracker:
                 es_mil = ac['source'] == "ADSB.lol-MIL"
                 tiene_prefijo = (callsign and callsign.startswith(OFFICIAL_PREFIXES)) or (reg and reg.startswith(OFFICIAL_PREFIXES))
                 es_comercial = (callsign and callsign.startswith(COMMERCIAL_PREFIXES)) or (reg and reg.startswith(COMMERCIAL_PREFIXES))
+                # Callsign o matricula LQ gana sobre el filtro comercial (ej. LQJVH con matricula LV-JVH en las bases)
+                if (callsign and callsign.startswith("LQ")) or (reg and reg.startswith("LQ")):
+                    es_comercial = False
                 
                 if (es_mil or tiene_prefijo) and not es_comercial:
                     # Alertar si no es un vuelo comercial común (ej. ARG1234 de Aerolineas)
@@ -470,10 +598,11 @@ class Tracker:
         vuelo = db.get_vuelo_activo(matricula)
         
         if en_vuelo and not vuelo:
-            near_icao, _ = self.find_nearest_airport(lat, lon)
-            orig = AEROPUERTOS.get(near_icao, {"nombre": "Desconocido", "ciudad": "Local"})
-            db.add_vuelo_activo(matricula, icao24, near_icao, orig['nombre'], orig['ciudad'], now_str, lat, lon, ac['alt'])
-            await self.notificador.alertar_despegue(a_db, orig['nombre'], orig['ciudad'], now_utc, icao24=icao24, source=ac['source'])
+            o_icao, o_nombre, o_ciudad, o_pais = await self.resolver_lugar(lat, lon)
+            if not o_icao and o_pais and o_pais != "Argentina" and o_pais not in o_ciudad:
+                o_ciudad = f"{o_ciudad} ({o_pais})"
+            db.add_vuelo_activo(matricula, icao24, o_icao, o_nombre, o_ciudad, now_str, lat, lon, ac['alt'])
+            await self.notificador.alertar_despegue(a_db, o_nombre, o_ciudad, now_utc, icao24=icao24, source=ac['source'])
         
         elif en_vuelo and vuelo:
             if matricula in self.pending_landings:
@@ -545,30 +674,29 @@ class Tracker:
             if dt_despegue.tzinfo is None: dt_despegue = dt_despegue.replace(tzinfo=datetime.timezone.utc)
             dur_min = int((now_utc - dt_despegue).total_seconds() / 60)
             
-            loc_name = await self.get_location_display(lat, lon)
-            parts = loc_name.split(",")
-            dest_n, dest_c = parts[0].strip(), (parts[1].strip() if len(parts) > 1 else parts[0].strip())
-            near_icao, _ = self.find_nearest_airport(lat, lon)
-            orig = AEROPUERTOS.get(vuelo['origen_icao'], {"nombre": "Desconocido", "ciudad": "Local", "pais": "Argentina"})
+            near_icao, dest_n, dest_c, dest_pais = await self.resolver_lugar(lat, lon)
+            orig = self._origen_de(vuelo)
             dist_km = geopy_distance((vuelo['despegue_lat'], vuelo['despegue_lon']), (lat, lon)).km
             
             v_data = {
                 "matricula": mat, "icao24": icao24, "callsign": ac['callsign'], "origen_icao": vuelo['origen_icao'],
                 "origen_nombre": orig['nombre'], "origen_ciudad": orig['ciudad'], "origen_pais": orig.get('pais', 'Argentina'),
-                "destino_icao": near_icao, "destino_nombre": dest_n, "destino_ciudad": dest_c, "destino_pais": AEROPUERTOS.get(near_icao, {}).get('pais', 'Argentina'),
+                "destino_icao": near_icao, "destino_nombre": dest_n, "destino_ciudad": dest_c, "destino_pais": dest_pais,
                 "despegue_utc": vuelo['despegue_utc'], "aterrizaje_utc": now_str, "duracion_min": dur_min,
                 "distancia_km": dist_km, "costo_usd": (dur_min/60)*(a_db.get('costo_hora_usd') or 0),
                 "consumo_fuel_l": (dur_min/60)*(a_db.get('litros_hora_estimado') or 0),
                 "emisiones_co2_kg": (dur_min/60)*(a_db.get('co2_kg_hora_estimado') or 0),
-                "es_internacional": 1 if orig.get('pais', 'Argentina') != AEROPUERTOS.get(near_icao, {}).get('pais', 'Argentina') else 0,
+                "es_internacional": 1 if orig.get('pais', 'Argentina') != dest_pais else 0,
                 "es_finde": 1 if dt_despegue.weekday() >= 5 else 0, "es_nocturno": 1 if dt_despegue.hour < 6 or dt_despegue.hour >= 23 else 0
             }
             
             try:
-                db.save_vuelo(v_data)
+                vuelo_id = db.save_vuelo(v_data)
                 db.remove_vuelo_activo(mat)
                 db.save_posicion(mat, icao24, lat, lon, ac['alt'], ac['vel_kmh'], 0, now_str)
-                await self.notificador.alertar_aterrizaje(a_db, v_data)
+                tweet_id = await self.notificador.alertar_aterrizaje(a_db, v_data)
+                if tweet_id and vuelo_id:
+                    db.set_tweet_id(vuelo_id, tweet_id)
                 logger.info(f"[TRACKER] Aterrizaje CONFIRMADO y guardado en DB para {mat} tras cumplir espera en tierra.")
             except Exception as e:
                 logger.error(f"[TRACKER] Error al guardar aterrizaje confirmado para {mat}: {e}")
@@ -584,6 +712,33 @@ class Tracker:
             d = geopy_distance((lat, lon), (a_lat, a_lon)).km
             if d < min_dist: min_dist, nearest = d, icao
         return nearest, min_dist
+
+    async def resolver_lugar(self, lat, lon, radio_km=20):
+        """(icao, nombre, ciudad, pais). Aeropuerto de la lista si esta a <= radio_km; si no, geocoder con pais real."""
+        icao, dist = self.find_nearest_airport(lat, lon)
+        if dist <= radio_km and icao in AEROPUERTOS:
+            a = AEROPUERTOS[icao]
+            return icao, a['nombre'], a['ciudad'], a.get('pais', 'Argentina')
+        try:
+            location = await asyncio.to_thread(self.geolocator.reverse, f"{lat}, {lon}", exactly_one=True, timeout=5, language="es")
+            if location:
+                addr = location.raw.get('address', {})
+                city = addr.get('city') or addr.get('town') or addr.get('village') or addr.get('county') or addr.get('state') or "Zona rural"
+                pais = addr.get('country') or "Desconocido"
+                ciudad = addr.get('state') or city if pais == "Argentina" else pais
+                return "", city, ciudad, pais
+        except Exception:
+            pass
+        return "", f"Posición {lat:.2f}, {lon:.2f}", "Desconocida", "Desconocido"
+
+    def _origen_de(self, vuelo):
+        """Datos de origen de un vuelo activo: aeropuerto de la lista o lo guardado al despegar."""
+        icao = vuelo.get('origen_icao') or ""
+        if icao in AEROPUERTOS:
+            return AEROPUERTOS[icao]
+        ciudad = vuelo.get('origen_ciudad') or ""
+        pais = ciudad.rsplit("(", 1)[-1].rstrip(")").strip() if ciudad.endswith(")") and "(" in ciudad else "Argentina"
+        return {"nombre": vuelo.get('origen_nombre') or "Desconocido", "ciudad": ciudad, "pais": pais}
 
     async def get_location_display(self, lat, lon):
         icao, dist = self.find_nearest_airport(lat, lon)
@@ -637,10 +792,8 @@ class Tracker:
                         if dt_despegue.tzinfo is None: dt_despegue = dt_despegue.replace(tzinfo=datetime.timezone.utc)
                         dur_min = int((now_utc - dt_despegue).total_seconds() / 60)
                         
-                        loc_name = await self.get_location_display(v['last_lat'], v['last_lon'])
-                        parts = loc_name.split(",")
-                        dest_n = parts[0].strip()
-                        dest_c = parts[1].strip() if len(parts) > 1 else dest_n
+                        near_icao, dest_n, dest_c, dest_pais = await self.resolver_lugar(v['last_lat'], v['last_lon'])
+                        o_pais = self._origen_de(v).get('pais', 'Argentina')
                         
                         # Buscar aeronave en la flota pre-cargada
                         aero = next((x for x in flota_completa if x['matricula'] == v['matricula']), None)
@@ -649,12 +802,12 @@ class Tracker:
                         v_data = {
                             "matricula": v['matricula'], "icao24": v['icao24'], "callsign": v.get('callsign', ''), 
                             "origen_icao": v['origen_icao'],
-                            "origen_nombre": v['origen_nombre'], "origen_ciudad": v['origen_ciudad'], "origen_pais": "Argentina",
-                            "destino_icao": near_icao, "destino_nombre": dest_n, "destino_ciudad": dest_c, "destino_pais": AEROPUERTOS.get(near_icao, {}).get('pais', 'Argentina'),
+                            "origen_nombre": v['origen_nombre'], "origen_ciudad": v['origen_ciudad'], "origen_pais": o_pais,
+                            "destino_icao": near_icao, "destino_nombre": dest_n, "destino_ciudad": dest_c, "destino_pais": dest_pais,
                             "despegue_utc": v['despegue_utc'], "aterrizaje_utc": now_str, "duracion_min": dur_min,
                             "distancia_km": geopy_distance((v['despegue_lat'], v['despegue_lon']), (v['last_lat'], v['last_lon'])).km,
                             "costo_usd": 0, "consumo_fuel_l": 0, "emisiones_co2_kg": 0,
-                            "es_internacional": 0, "es_finde": 0, "es_nocturno": 0
+                            "es_internacional": 1 if o_pais != dest_pais else 0, "es_finde": 0, "es_nocturno": 0
                         }
                         
                         if aero:

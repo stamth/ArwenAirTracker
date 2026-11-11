@@ -27,7 +27,7 @@ AEROPUERTOS = {
     "SAZM": {"nombre": "Mar del Plata", "ciudad": "Mar del Plata", "pais": "Argentina", "provincia": "Buenos Aires", "lat": -37.9343, "lon": -57.5738},
     "SAOU": {"nombre": "San Luis", "ciudad": "San Luis", "pais": "Argentina", "provincia": "San Luis", "lat": -33.2825, "lon": -66.3875},
     "SANL": {"nombre": "La Rioja", "ciudad": "La Rioja", "pais": "Argentina", "provincia": "La Rioja", "lat": -29.4140, "lon": -66.7835},
-    "SADF": {"nombre": "San Fernando", "ciudad": "San Fernando", "pais": "Argentina", "provincia": "Buenos Aires", "lat": -34.4447, "lon": -58.5343},
+    "SADF": {"nombre": "San Fernando", "ciudad": "San Fernando", "pais": "Argentina", "provincia": "Buenos Aires", "lat": -34.4533, "lon": -58.5894},
     "SADP": {"nombre": "Base Aérea El Palomar", "ciudad": "El Palomar", "pais": "Argentina", "provincia": "Buenos Aires", "lat": -34.6783, "lon": -58.5738},
     "SADM": {"nombre": "Base Aérea Morón", "ciudad": "Morón", "pais": "Argentina", "provincia": "Buenos Aires", "lat": -34.6567, "lon": -58.6197},
     "SCEL": {"nombre": "Santiago Chile", "ciudad": "Santiago", "pais": "Chile", "lat": -33.3930, "lon": -70.7858},

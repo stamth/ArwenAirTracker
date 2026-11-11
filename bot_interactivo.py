@@ -7,6 +7,7 @@ import re
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from db import db
+from api_health import health
 import stats
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,10 @@ class BotInteractivo:
             msg += "/deletestats &lt;matricula&gt; - Borrar historial\n"
             msg += "/agregar - Agregar aeronave manualmente\n"
             msg += "/quitar &lt;matricula&gt; - Dejar de seguir\n\n"
+            msg += "📡 <b>APIs:</b>\n"
+            msg += "/online - Estado de las APIs en el último ciclo\n"
+            msg += "/errores - Errores de conexión de las últimas 24 h\n"
+            msg += "/errores &lt;dias&gt; - Errores de los últimos N días (máx 90)\n\n"
             msg += "🕵️ <b>Cazador Inteligente:</b>\n"
             msg += "/candidatas - Ver hallazgos del cazador\n"
             msg += "/candidatas excel - Descargar plantilla Excel para reclutar\n"
@@ -111,7 +116,10 @@ class BotInteractivo:
             msg += "/cancelar - Cancelar proceso de carga\n"
             msg += "/ignorar &lt;callsign&gt; - Lista negra permanente\n"
             msg += "/designorar &lt;callsign&gt; - Sacar de lista negra\n"
-            msg += "/ignorados - Ver lista negra\n\n"
+            msg += "/ignorados - Ver lista negra\n"
+            msg += "/hex &lt;matrícula&gt; &lt;hex&gt; - Cambiar hex de cualquier aeronave\n"
+            msg += "/hexArg01 &lt;hex&gt; - Cambiar hex del ARG-01\n"
+            msg += "/hexArg01alt &lt;hex&gt; - Agregar avión alternativo del presidente (borrar &lt;hex&gt; para sacar)\n\n"
             msg += "🐦 <b>Twitter:</b>\n"
             msg += "/tweetstatus - Estado de Twitter\n"
             msg += "/agregar_tweet &lt;mat&gt; - Autorizar Twitter\n"
@@ -237,8 +245,25 @@ class BotInteractivo:
 
     # --- COMANDOS ADMIN ---
 
+    async def online(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update): return
+        if not await self._check_owner(update): return
+        await update.message.reply_html(health.texto_online())
+
+    async def errores(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_auth(update): return
+        if not await self._check_owner(update): return
+        dias = 1
+        if context.args:
+            try:
+                dias = max(1, min(90, int(context.args[0])))
+            except ValueError:
+                await update.message.reply_text("Uso: /errores o /errores <dias> (1 a 90)")
+                return
+        await update.message.reply_html(health.texto_errores(dias))
+
     async def autorizar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._check_owner(update): 
+        if not await self._check_owner(update, silent=True):
             await update.message.reply_text("Solo el dueño puede hacer esto.")
             return
         if len(context.args) < 2:
@@ -734,6 +759,81 @@ class BotInteractivo:
             msg += f"• <code>{c['callsign']}</code> ({c['icao24']}) - Visto {c['veces_visto']} veces\n"
         await update.message.reply_html(msg)
 
+    async def _set_hex(self, update, context, mat, comando):
+        if not await self._check_owner(update): return
+        actual = (db.get_aeronave(mat) or {}).get("icao24") or "ninguno"
+        if not context.args:
+            extra = f"\n{comando} borrar - quitar el hex" if mat.endswith("-ALT") else ""
+            await update.message.reply_html(f"Uso: {comando} &lt;hex&gt;{extra}\nHex actual de {mat}: <code>{actual}</code>")
+            return
+        hx = context.args[0].strip().lower()
+        if hx == "borrar" and mat.endswith("-ALT"):
+            db.set_aeronave_hex(mat, "")
+            await update.message.reply_html(f"🗑️ Hex de {mat} borrado (era <code>{actual}</code>).")
+            return
+        if not re.fullmatch(r"[0-9a-f]{6}", hx) or hx == "000000" or re.fullmatch(r"e000[0-9a-f]{2}", hx):
+            await update.message.reply_text("⛔ Hex inválido. Tienen que ser 6 caracteres hexadecimales, ej: e200dd")
+            return
+        for a in db.get_all_aeronaves(solo_activas=False):
+            if a["matricula"] != mat and (a.get("icao24") or "").lower() == hx:
+                await update.message.reply_html(f"⛔ <code>{hx}</code> ya es el hex de <b>{a['matricula']}</b>.")
+                return
+        db.set_aeronave_hex(mat, hx)
+        logger.info(f"[HEX] {mat}: hex cambiado a mano de {actual} a {hx}")
+        await update.message.reply_html(f"✅ Hex de <b>{mat}</b> actualizado: <code>{actual}</code> → <code>{hx}</code>\nSe aplica desde el próximo escaneo.")
+
+    async def hex_general(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_owner(update): return
+        args = context.args or []
+        if not args:
+            await update.message.reply_html("Uso: /hex &lt;matrícula&gt; &lt;hex&gt;\nEjemplo: /hex ARG-02 e01645\n/hex &lt;matrícula&gt; muestra el hex actual")
+            return
+        mat = args[0].strip().upper()
+        if mat == "ARG-01-ALT":
+            await update.message.reply_text("Para alternativos del ARG-01 usá /hexArg01alt")
+            return
+        if not db.get_aeronave(mat):
+            await update.message.reply_html(f"⛔ No existe la matrícula <code>{mat}</code> en la flota.")
+            return
+        context.args = args[1:]
+        await self._set_hex(update, context, mat, f"/hex {mat}")
+
+    async def hex_arg01(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self._set_hex(update, context, "ARG-01", "/hexArg01")
+
+    async def hex_arg01_alt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await self._check_owner(update): return
+        lista = db.get_alt_hexes("ARG-01")
+        args = [a.strip().lower() for a in (context.args or [])]
+        if not args:
+            txt = ", ".join(f"<code>{h}</code>" for h in lista) or "ninguno"
+            await update.message.reply_html(
+                f"Alternativos del ARG-01: {txt}\n\n"
+                "/hexArg01alt &lt;hex&gt; - agregar\n/hexArg01alt borrar &lt;hex&gt; - sacar\n\n"
+                "<i>Cuentan solo mientras vuelen con callsign ARG01. Si vuelan con otro callsign se sacan solos.</i>")
+            return
+        borrar = args[0] == "borrar"
+        hx = args[1] if borrar and len(args) > 1 else (None if borrar else args[0])
+        if not hx or not re.fullmatch(r"[0-9a-f]{6}", hx) or hx == "000000" or re.fullmatch(r"e000[0-9a-f]{2}", hx):
+            await update.message.reply_text("⛔ Hex inválido. Tienen que ser 6 caracteres hexadecimales, ej: e123dd")
+            return
+        if borrar:
+            if hx not in lista:
+                await update.message.reply_html(f"<code>{hx}</code> no estaba en la lista.")
+                return
+            db.set_alt_hexes([h for h in lista if h != hx], "ARG-01")
+            await update.message.reply_html(f"🗑️ <code>{hx}</code> sacado de alternativos del ARG-01.")
+            return
+        for a in db.get_all_aeronaves(solo_activas=False):
+            if (a.get("icao24") or "").lower() == hx:
+                await update.message.reply_html(f"⛔ <code>{hx}</code> ya es el hex de <b>{a['matricula']}</b>.")
+                return
+        db.set_alt_hexes(lista + [hx], "ARG-01")
+        logger.info(f"[HEX] {hx} agregado a alternativos del ARG-01")
+        await update.message.reply_html(
+            f"✅ <code>{hx}</code> agregado a alternativos del ARG-01.\n"
+            "Cuenta como presidencial mientras vuele con callsign ARG01. Si cambia de callsign se saca solo.")
+
     async def ignorar(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_owner(update): return
         if not context.args:
@@ -993,11 +1093,16 @@ class BotInteractivo:
         self.app.add_handler(CommandHandler("ignorar", self.ignorar))
         self.app.add_handler(CommandHandler("designorar", self.designorar))
         self.app.add_handler(CommandHandler("ignorados", self.ignorados))
+        self.app.add_handler(CommandHandler("hex", self.hex_general))
+        self.app.add_handler(CommandHandler("hexArg01", self.hex_arg01))
+        self.app.add_handler(CommandHandler("hexArg01alt", self.hex_arg01_alt))
         self.app.add_handler(CommandHandler("tweetstatus", self.tweetstatus))
         self.app.add_handler(CommandHandler("agregar_tweet", self.agregar_tweet))
         self.app.add_handler(CommandHandler("quitar_tweet", self.quitar_tweet))
         self.app.add_handler(CommandHandler("listar_tweet", self.listar_tweet))
         self.app.add_handler(CommandHandler("informe", self.generar_informe))
+        self.app.add_handler(CommandHandler("online", self.online))
+        self.app.add_handler(CommandHandler("errores", self.errores))
 
         # Message handler para el flujo conversacional de agregar
         self.app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_text))

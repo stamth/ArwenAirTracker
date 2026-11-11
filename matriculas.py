@@ -3,7 +3,9 @@
 # Base de datos de aeronaves oficiales y gubernamentales de Argentina
 AERONAVES_DATA = [
     # PRESIDENCIALES
-    ("ARG-01", "ARG-01 (Ex T-01)", "Presidencia de la Nacion", "Nacional", "Boeing", "737-800 BBJ", 50000000, 15000, 3200, 8000),
+    ("ARG-01", "ARG-01 (Ex T-01)", "Presidencia de la Nacion", "Nacional", "Boeing", "757-256", 25000000, 15000, 3800, 9500),
+    # Avion alternativo que usa el presidente con callsign ARG01. Hex se carga con /hexArg01alt. Modelo sale del feed.
+    ("ARG-01-ALT", "ARG-01 (avion alternativo)", "Presidencia de la Nacion", "Nacional", "", "", 0, 0, 0, 0),
     ("ARG-02", "ARG-02 (Ex T-02)", "Presidencia de la Nacion", "Nacional", "Boeing", "737-500", 15000000, 12000, 2800, 7100),
     ("ARG-03", "ARG-03 (Ex T-03)", "Presidencia de la Nacion", "Nacional", "Bombardier", "Learjet 60", 3500000, 5200, 800, 2000),
     ("ARG-10", "ARG-10 (Helicoptero)", "Presidencia de la Nacion", "Nacional", "Sikorsky", "S-70 Black Hawk", 12000000, 4500, 600, 1500),
@@ -62,7 +64,7 @@ AERONAVES_DATA = [
 ]
 
 MATRICULA_TO_ICAO24 = {
-    "ARG-01": "e00000", "ARG-02": "e00001", "ARG-03": "e14d34", 
+    "ARG-01": "e200dd", "ARG-02": "e01645", "ARG-03": "e14d34", 
     "ARG-10": "e00002", "ARG-11": "e00003", "ARG-12": "e00004", 
     "LQ-BFS": "e02193", "LQ-CPS": "e03413", "LQ-WOT": "e00015",
     "LV-CLK": "e0330b", "LV-CTX": "e03518", "LV-FUK": "e0654b", 

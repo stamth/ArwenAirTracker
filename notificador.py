@@ -80,7 +80,9 @@ class Notificador:
 
             # v2 usa create_tweet y el límite es 280 caracteres
             tweet_text = (text[:277] + "...") if len(text) > 280 else text
-            self.twitter_client.create_tweet(text=tweet_text)
+            resp = self.twitter_client.create_tweet(text=tweet_text)
+            data = getattr(resp, "data", None) or {}
+            self.last_tweet_id = str(data.get("id")) if data.get("id") else None
             logger.info(f"[TWITTER] Tweet enviado con éxito.")
             return True
         except Exception as e:
@@ -187,8 +189,50 @@ class Notificador:
             tweet += f"✈️ {modelo_avion}\n"
             tweet += f"🕒 {now_arg.strftime('%H:%M')} (ARG)\n"
             tweet += f"#AvionesDeLEstado #Aerobot"
+            self.last_tweet_id = None
             resultado = await asyncio.to_thread(self._send_tweet, tweet)
             await self._reportar_resultado_tweet(resultado)
+            if resultado is True:
+                return self.last_tweet_id
+        return None
+
+    async def alertar_hex_distinto(self, mat, icao24, callsign, reg, desc, source=None):
+        """Aviso privado: apareció la matrícula o el callsign de ARG-01 con un hex que no es el suyo."""
+        if self._is_throttled(f"hexdiff_{icao24}", 6 * 3600): return
+        actual = (db.get_aeronave(mat) or {}).get("icao24") or "ninguno"
+        alt = ", ".join(db.get_alt_hexes(mat)) or "ninguno"
+        esc = lambda t: str(t or "-").replace("<", "&lt;").replace(">", "&gt;")
+        msg = f"⚠️ <b>{mat}: apareció con otro hex</b>\n\n"
+        msg += f"Hex detectado: <code>{icao24}</code>\n"
+        msg += f"Matrícula (feed): <b>{esc(reg)}</b>\n"
+        msg += f"Callsign: <b>{esc(callsign)}</b>\n"
+        msg += f"Modelo (feed): {esc(desc)}\n"
+        if source:
+            msg += f"Fuente: <i>{esc(source)}</i>\n"
+        msg += f"\nHex actual de {mat}: <code>{actual}</code>\nAlternativo: <code>{alt}</code>\n\n"
+        msg += "<b>No lo estoy registrando.</b>\n"
+        msg += f"Si es el {mat} con hex nuevo: /hexArg01 {icao24}\n"
+        msg += f"Si es otro avión que usa el presidente: /hexArg01alt {icao24}"
+        logger.info(f"[HEX] {mat} visto con hex {icao24} (reg={reg}, cs={callsign}). No registrado, aviso al dueño.")
+        await self._send_owner(msg)
+
+    async def alertar_alt_capturado(self, icao24, callsign, reg, desc, source=None):
+        """Aviso privado: hex nuevo volando como ARG01, capturado y seguido como ARG-01 alternativo."""
+        esc = lambda t: str(t or "-").replace("<", "&lt;").replace(">", "&gt;")
+        msg = "🇦🇷 <b>ARG-01: hex nuevo capturado</b>\n\n"
+        msg += f"Hex: <code>{icao24}</code>\nCallsign: <b>{esc(callsign)}</b>\nMatrícula (feed): <b>{esc(reg)}</b>\n"
+        msg += f"Modelo (feed): {esc(desc)}\n"
+        if source:
+            msg += f"Fuente: <i>{esc(source)}</i>\n"
+        msg += "\nLo sumé a los alternativos del ARG-01: lo sigo en todo el mundo (OpenSky + ADSB.lol) y aviso despegue/aterrizaje.\n"
+        msg += f"Si no es del presidente: /hexArg01alt borrar {icao24}"
+        await self._send_owner(msg)
+
+    async def alertar_alt_removido(self, icao24, callsign):
+        cs = str(callsign).replace("<", "&lt;").replace(">", "&gt;")
+        msg = f"ℹ️ <b>ARG-01 alternativo</b>\n\n<code>{icao24}</code> ahora vuela como <b>{cs}</b>.\n"
+        msg += "Lo saqué de la lista de alternativos: ya no se cuenta como presidencial."
+        await self._send_owner(msg)
 
     async def alertar_desconocida(self, callsign, icao24, pais, source=None):
         if self._is_throttled(f"unknown_{icao24}", 3600): return

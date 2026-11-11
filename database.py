@@ -109,6 +109,17 @@ class Database:
                 )
             ''')
 
+            schema_api_errores = '''
+                CREATE TABLE IF NOT EXISTS api_errores (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts_utc TEXT, api TEXT, tipo TEXT, detalle TEXT
+                )
+            '''
+            if self.is_postgres:
+                schema_api_errores = schema_api_errores.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            cursor.execute(schema_api_errores)
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_api_errores_ts ON api_errores (ts_utc)')
+
     def seed_db(self, aeronaves_data, matricula_to_icao):
         """Siembra y actualiza datos de aeronaves en cada inicio para reflejar cambios en matriculas.py."""
         with self.connection_scope() as conn:
@@ -120,10 +131,21 @@ class Database:
                 "marca", "modelo", "precio_usd", "costo_hora_usd", 
                 "litros_hora_estimado", "co2_kg_hora_estimado"
             ]
+            # Hex cargados a mano con /hexArg01 y /hexArg01alt (settings hex_<matricula>) ganan sobre matriculas.py
+            cursor.execute("SELECT key, value FROM settings WHERE key LIKE 'hex_%'")
+            hex_override = {r["key"][4:]: (r["value"] or "").lower() for r in cursor.fetchall()}
             for item in aeronaves_data:
                 # Mapear los datos de la lista al diccionario de columnas
                 data = dict(zip(fields, item))
                 data["icao24"] = matricula_to_icao.get(data["matricula"], "").lower()
+                if data["matricula"] in hex_override:
+                    data["icao24"] = hex_override[data["matricula"]]
+                if not data["icao24"]:
+                    # No pisar con vacio un hex aprendido en vuelo (auto-update): si no, se pierde en cada reinicio
+                    cursor.execute("SELECT icao24 FROM aeronaves WHERE matricula = %s" if self.is_postgres else "SELECT icao24 FROM aeronaves WHERE matricula = ?", (data["matricula"],))
+                    prev = cursor.fetchone()
+                    if prev and prev["icao24"]:
+                        data["icao24"] = prev["icao24"]
                 data["activa"] = 1
                 
                 cols = ", ".join(data.keys())
@@ -200,6 +222,24 @@ class Database:
             else:
                 cursor.execute(sql, list(v.values()))
                 return cursor.lastrowid
+
+    def set_tweet_id(self, vuelo_id, tweet_id):
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            cursor.execute("UPDATE vuelos SET tweet_id = %s WHERE id = %s" if self.is_postgres else "UPDATE vuelos SET tweet_id = ? WHERE id = ?", (str(tweet_id), vuelo_id))
+
+    def set_aeronave_hex(self, matricula, icao24):
+        """Fija el hex de una aeronave y lo persiste para que el seed de matriculas.py no lo pise."""
+        self.set_setting(f"hex_{matricula}", icao24)
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            cursor.execute("UPDATE aeronaves SET icao24 = %s WHERE matricula = %s" if self.is_postgres else "UPDATE aeronaves SET icao24 = ? WHERE matricula = ?", (icao24, matricula))
+
+    def get_alt_hexes(self, mat="ARG-01"):
+        return [h for h in (self.get_setting(f"hex_alt_{mat}", "") or "").split(",") if h]
+
+    def set_alt_hexes(self, hexes, mat="ARG-01"):
+        self.set_setting(f"hex_alt_{mat}", ",".join(dict.fromkeys(h.lower() for h in hexes if h)))
 
     def set_setting(self, key, val):
         with self.connection_scope() as conn:
@@ -300,6 +340,28 @@ class Database:
             cursor = self.get_cursor(conn)
             cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)).isoformat()
             cursor.execute("DELETE FROM aeronaves_candidatas WHERE primer_avistamiento < %s" if self.is_postgres else "DELETE FROM aeronaves_candidatas WHERE primer_avistamiento < ?", (cutoff,))
+            return cursor.rowcount
+
+    def add_api_error(self, api, tipo, detalle):
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            sql = "INSERT INTO api_errores (ts_utc, api, tipo, detalle) VALUES (%s,%s,%s,%s)" if self.is_postgres else "INSERT INTO api_errores (ts_utc, api, tipo, detalle) VALUES (?,?,?,?)"
+            cursor.execute(sql, (ts, api, tipo, detalle))
+
+    def get_api_errores_resumen(self, desde_utc):
+        """Cantidad de errores por API y tipo desde una fecha (ISO UTC)."""
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            sql = "SELECT api, tipo, COUNT(*) AS cantidad, MAX(ts_utc) AS ultimo FROM api_errores WHERE ts_utc >= {} GROUP BY api, tipo ORDER BY api, cantidad DESC"
+            cursor.execute(sql.format("%s" if self.is_postgres else "?"), (desde_utc,))
+            return [dict(r) for r in cursor.fetchall()]
+
+    def purge_old_api_errores(self, days=90):
+        with self.connection_scope() as conn:
+            cursor = self.get_cursor(conn)
+            cutoff = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)).isoformat()
+            cursor.execute("DELETE FROM api_errores WHERE ts_utc < %s" if self.is_postgres else "DELETE FROM api_errores WHERE ts_utc < ?", (cutoff,))
             return cursor.rowcount
 
     def add_usuario_autorizado(self, user_id, username):
